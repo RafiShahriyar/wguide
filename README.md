@@ -1,36 +1,58 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# GuideForge
 
-## Getting Started
+A desktop video editor for game guide creators. Pause on the timeline, drop
+keyboards / text / arrows / images that annotate character and ability
+rotations, then export an MP4.
 
-First, run the development server:
+Built for Wuthering Waves-style rotation guides, with a plugin path for other
+games (Genshin, ZZZ, League, Valorant).
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Stack
+
+| Layer | Tech | Folder |
+|-------|------|--------|
+| UI | React (Next.js static export) + Redux Toolkit + Tailwind | `frontend/` |
+| Backend | Go (HTTP sidecar; later ffmpeg rendering) | `backend/` |
+| Shell | Tauri v2 (Rust) | `src-tauri/` |
+| Docs | Design docs from day one | `docs/` |
+
+**Architecture:** a Tauri shell owns the native window and spawns a Go sidecar
+over localhost HTTP. The React UI is a static SPA served by Tauri; all app
+state lives in Redux. See `docs/Architecture.md`.
+
+## Prerequisites
+
+- Node.js 20+ (LTS)
+- Go 1.22+
+- Rust (stable, with MSVC toolchain — VS Build Tools 2022)
+- FFmpeg (for M8 rendering)
+- Git
+
+## Quick start
+
+```sh
+npm install                 # root tooling + @tauri-apps/cli
+npm run backend:build       # compile Go sidecar into src-tauri/binaries
+npm run dev                 # launch the desktop app (Tauri)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Debug the UI alone in a browser (no Tauri window):
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```sh
+npm run backend:dev         # run the Go backend
+npm run frontend:dev        # Next dev server on http://localhost:3000
+open http://localhost:3000  # "Hello GuideForge" connects to the backend
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Build installers: `npm run build`.
 
-## Learn More
+## Status
 
-To learn more about Next.js, take a look at the following resources:
+Milestone 1 (project foundation) is complete and verified end-to-end. See
+`docs/Roadmap.md` for the full 10-milestone plan.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Roadmap status
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- ✅ **M1 Foundation** — desktop window, React + Redux + Go connected
+- ⬜ M2 Layout → M3 Player → M4 Timeline → M5 Overlays → M6 Inspector
+- ⬜ M7 Editing → M8 Rendering → M9 Project files → M10 Polish
