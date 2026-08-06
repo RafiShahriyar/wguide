@@ -304,6 +304,34 @@ orphaned action is finally used.
 with `Get-CimInstance Win32_Process -Filter "Name like 'guideforge%'"` and
 clean up with `Stop-Process -Id <pid> -Force`.
 
+## Milestone 3 — Video Player
+
+Goal: open an MP4, play/pause, seek, and see the current time — without the
+UI ever feeling blocked. The `<video>` element stays the source of truth for
+playback; Redux keeps a throttled mirror the UI reads from.
+
+### Step 1 — `playerSlice` + store registration
+(`frontend/features/player/playerSlice.ts`, `playerSelectors.ts`,
+`frontend/store/store.ts`)
+
+**New concepts:** a third slice; what a *player* needs in state; the store is
+now a map of slices.
+
+- **Shape choices:** `status: "empty" | "ready"` (has anything loaded?);
+  `sourceUrl` + `fileName` (what's open); `isPlaying`, `currentTime`,
+  `duration` (the mirrored playback state); `pickRequest` (a counter used only
+  as a *signal* — "bump me and I'll open the file dialog").
+- **`videoOpened`, `clearVideo`** — load/unload. Note the reducer does NOT
+  revoke the old object URL: that's a side effect and a reducer must stay
+  pure. The component handles it when opening the next file.
+- **`setTime`/`setDuration`** — mirrors what the `<video>` reports. The video
+  element remains the owner of real playback; Redux just reflects it.
+- **Registered in the store** alongside `system` and `layout`. ConfigureStore
+  keys the state by slice name, so everywhere it's `state.player`.
+
+**Why this ordering:** build the data model first, UI second. Step 2 will
+start filling `status`/`sourceUrl` by opening a real file.
+
 ## Appendix — file map (M2 so far)
 
 | File | Role |
