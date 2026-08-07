@@ -5,10 +5,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useAppDispatch } from "@/hooks/useRedux";
 import { resetLayout } from "@/features/layout/layoutSlice";
+import { requestPick } from "@/features/player/playerSlice";
 
 // All the possible things a menu item can DO. Only actions listed here are
 // wired to real code — every other item renders disabled.
-type MenuAction = "resetLayout";
+type MenuAction = "resetLayout" | "openVideo";
 
 interface MenuItem {
   label: string;
@@ -28,7 +29,7 @@ const MENUS: Menu[] = [
   {
     name: "File",
     items: [
-      { label: "Open Video…", shortcut: "Ctrl+O" },
+      { label: "Open Video…", shortcut: "Ctrl+O", action: "openVideo" },
       { label: "Export MP4…", shortcut: "Ctrl+E" },
     ],
   },
@@ -75,7 +76,11 @@ export function MenuBar() {
 
   function onItemClick(item: MenuItem) {
     setOpenMenu(null);
-    if (item.action === "resetLayout") {
+    if (item.action === "openVideo") {
+      // MenuBar never opens a file dialog itself — it bumps the pickRequest
+      // signal and the VideoPicker component reacts.
+      dispatch(requestPick());
+    } else if (item.action === "resetLayout") {
       dispatch(resetLayout());
     }
   }

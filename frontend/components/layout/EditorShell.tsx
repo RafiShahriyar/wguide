@@ -11,9 +11,11 @@ import { PropertiesPanel } from "@/features/layout/components/PropertiesPanel";
 import { TimelinePanel } from "@/features/layout/components/TimelinePanel";
 import { useAppSelector } from "@/hooks/useRedux";
 import { selectPanels } from "@/features/layout/layoutSelectors";
+import { usePlayerShortcuts } from "@/features/player/hooks/usePlayerShortcuts";
 
 export function EditorShell() {
   const panels = useAppSelector(selectPanels);
+  usePlayerShortcuts();
 
   return (
     // CSS Grid lays out the four big rows. grid-template-areas lets us

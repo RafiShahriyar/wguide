@@ -2,6 +2,7 @@
 
 import { createSlice } from "@reduxjs/toolkit";
 import type { PayloadAction } from "@reduxjs/toolkit";
+import { clamp } from "@/utils/clamp";
 
 export interface PlayerState {
   // "empty" = no video open yet; "ready" = one is loaded and playable.
@@ -15,6 +16,12 @@ export interface PlayerState {
   // Every time this bumps, the picker component opens the file dialog.
   // It's a "signal" counter, not real data.
   pickRequest: number;
+  // Command fields: a keyboard shortcut wants to jump the playhead, but the
+  // playhead lives on the native element. So `seekBy` records the target
+  // (seekTime) and bumps `seekRequest`; VideoPlayer's effect applies it to the
+  // element exactly like it applies `isPlaying`.
+  seekRequest: number;
+  seekTime: number;
 }
 
 const initialState: PlayerState = {
@@ -25,6 +32,8 @@ const initialState: PlayerState = {
   currentTime: 0,
   duration: 0,
   pickRequest: 0,
+  seekRequest: 0,
+  seekTime: 0,
 };
 
 const playerSlice = createSlice({
@@ -67,6 +76,18 @@ const playerSlice = createSlice({
     setDuration(state, action: PayloadAction<number>) {
       state.duration = action.payload;
     },
+    // Jump the playhead by a delta (±5s). Clamped to the video length. This
+    // only schedules the jump in state — VideoPlayer applies it to the element.
+    seekBy(state, action: PayloadAction<number>) {
+      const target = clamp(
+        state.currentTime + action.payload,
+        0,
+        state.duration || 0,
+      );
+      state.currentTime = target;
+      state.seekTime = target;
+      state.seekRequest += 1;
+    },
   },
 });
 
@@ -77,6 +98,7 @@ export const {
   setPlaying,
   setTime,
   setDuration,
+  seekBy,
 } = playerSlice.actions;
 
 export default playerSlice.reducer;
