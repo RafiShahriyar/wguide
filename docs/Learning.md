@@ -7,6 +7,10 @@ code, step by step. Append to it as we build. Read it like notes from a mentor.
 
 - Each **Step** corresponds to one component/milestone of work.
 - Every step has the same shape: files touched → data flow → concepts → pitfalls.
+- **Explain by example.** Abstract rules are paired with a **worked, click-by-click
+  walkthrough** (like the video-player walkthrough below) — a concrete trace of
+  "what the user does" → "which event fires" → "what the store holds" is worth
+  more than a definition. New material should follow that style.
 - If you forget how something works, search this file before asking.
 
 ---
@@ -332,6 +336,217 @@ now a map of slices.
 **Why this ordering:** build the data model first, UI second. Step 2 will
 start filling `status`/`sourceUrl` by opening a real file.
 
+### Step 2 — Open a video (`features/player/components/VideoPicker.tsx`, MenuBar, PreviewPanel)
+
+**New concepts:** using the store as a *signal*; `<input type="file">`;
+object URLs; where side effects must live.
+
+- **Signal, not data:** the menu bar can't open a dialog by itself, and the
+  picker can't know when the menu was clicked. So the MenuBar just dispatches
+  `requestPick()` which bumps `player.pickRequest`. The `VideoPicker` — the
+  **single owner** of the real `<input>` — watches that value in a `useEffect`
+  and calls `inputRef.current.click()` when it changes. One writer, one
+  reader, the store in between. Same pattern as the panels.
+- **`<input type="file" accept="video/*">`** is hidden (`className="hidden"`)
+  but its `.click()` still opens the OS file dialog. `accept="video/*"` hints
+  the picker to show video files.
+- **Object URLs:** `URL.createObjectURL(file)` returns a `blob:` URL the
+  `<video>` element can play without loading the whole file into memory. It is
+  a *lease* on memory — always `URL.revokeObjectURL(oldUrl)` when replacing,
+  or you leak.
+- **Why the revoke lives in the component, not the reducer:** revoking a URL
+  is a side effect, and reducers must stay **pure** (same input → same output,
+  no I/O). Components own side effects (revoking, calling `.click()`, DOM),
+  reducers compute new state. This stays true the whole project.
+- **Reset `event.target.value = ""`** after reading the file, so selecting the
+  *same* file again re-triggers `onChange`.
+- **Wiring the disabled item:** the File → Open Video menu item got
+  `action: "openVideo"` and `MenuAction` gained `"openVideo"`. `onItemClick`
+  now dispatches `requestPick()` for it. The menu is genuinely useful now.
+
+**Flow:**
+```
+File → Open Video (or empty-state button)  →  dispatch(requestPick())
+  → VideoPicker: pickRequest changed       →  input.click() → OS picker
+  → onChange: revoke old URL → objectURL → dispatch(videoOpened({fileName, sourceUrl}))
+  → store.player = { status:"ready", sourceUrl: blob:…, fileName }
+  → PreviewPanel re-renders and shows the file name.
+```
+
+### Step 3 — Preview + transport controls
+(`features/player/components/VideoPlayer.tsx`, `TransportBar.tsx`,
+`formatTime.ts`)
+
+**New concepts:** owning a native element via ref + mirroring its events into
+the store; the two-way bridge; controlled seek with a drag "draft"; why the
+element, not Redux, keeps the clock.
+
+- **Two one-way bridges.** The element is the source of truth for playback.
+  - *Element → store:* `useEffect` attaches listeners — `loadedmetadata`
+    → `setDuration`, `timeupdate` → `setTime`, `play`/`pause` → `setPlaying`,
+    `ended` → pause. The element drives; Redux mirrors.
+  - *Store → element:* a second effect watches `isPlaying`; when it flips it
+    calls `video.play()`/`video.pause()` on the element. The events echo the
+    change back to the store — **no loop**, because dispatching the same value
+    doesn't re-render.
+- **User clicks play/pause directly on the element** (`video.paused` → play
+  or pause). The store learns via the `play`/`pause` events. The button icon
+  therefore always reflects reality.
+- **The seek "draft":** while dragging the range thumb, `timeupdate` keeps
+  echoing the element's *real* time, which would yank the thumb back. So the
+  bar tracks a local `draft` while the pointer is down; the display shows
+  `draft ?? currentTime`, and `draft` clears on release. Live-seek fires
+  `onSeek(v)` on every change.
+- **`formatTime`** — tiny pure helper `seconds → "m:ss"`. `padStart(2, "0")`
+  guarantees two digits.
+- **Presenter vs. owner:** `TransportBar` knows nothing about the `<video>`.
+  It receives `onTogglePlay`/`onSeek` callbacks + reads mirrored values, so it
+  stays reusable/presentational. `VideoPlayer` owns the element + the refs +
+  the DOM work.
+
+**Pitfall (TypeScript):** inside a `useEffect`, `videoRef.current` is typed
+`HTMLVideoElement | null`. The guard `if (!video) return` narrows it, but the
+narrowing is **lost inside nested closures** (the event handlers), so
+`video.duration` errors as "possibly null". Fix: capture `const el =
+videoRef.current!` — the `!` asserts non-null (safe: the ref is always
+attached by effect time). This "narrowing doesn't cross into closures" rule
+applies to `let`/`const` of nullable refs.
+
+**Flow:**
+```
+<video> loadedmetadata → dispatch setDuration → seekbar knows the max
+<video> timeupdate    → dispatch setTime     → readout + thumb follow
+Play button / isPlaying effect → video.play() → play event → isPlaying=true
+```
+
+### Worked example — one video, five actions (upload, play 5s, pause, seek, play)
+
+The whole player is a loop between **three players**: the native `<video>`
+(truth), the Redux `player` slice (mirror), and the views that subscribe
+(`TransportBar`, `PreviewPanel`). Trace it click by click.
+
+Initial store:
+```
+player = { status:"empty", sourceUrl:null, fileName:null, isPlaying:false, currentTime:0, duration:0, pickRequest:0 }
+```
+
+**1) Upload**
+```
+You click "Open a video…"  →  dispatch(requestPick())  →  pickRequest 0→1
+VideoPicker useEffect (watches pickRequest) → inputRef.click() → OS dialog
+You pick myVideo.mp4 → onChange → URL.createObjectURL(file) → blob:…
+  → dispatch(videoOpened({fileName, sourceUrl: blob}))
+store.player: { status:"ready", sourceUrl:"blob:…", fileName:"myVideo.mp4" }
+```
+PreviewPanel sees `status === "ready"` → renders `<VideoPlayer sourceUrl="blob:…"/>`.
+
+VideoPlayer mounts → **effect #1 runs:**
+```
+el.src = blob:…   → browser starts fetching/parsing the MP4
+   └─ pipeline reads header → fires loadedmetadata → dispatch setDuration(60)
+```
+(You'd see the log `[log] loadedmetadata — duration: 60`.)
+
+**2) Play for 5s**
+```
+You click ▶ → TransportBar onTogglePlay → VideoPlayer.togglePlay()
+   video.paused === true → video.play()
+        browser buffers, starts its clock, THEN fires play
+        → onPlay → dispatch setPlaying(true)
+store: isPlaying: true
+every ~15–250ms the clock advances, firing timeupdate → setTime(v)
+   currentTime streams 0 → 5; the readout and thumb follow each event.
+```
+After 5s: `store = { isPlaying:true, currentTime:≈5, duration:60 }`
+
+**3) Pause**
+```
+You click ⏸ → togglePlay → video.paused === false → video.pause()
+   browser stops the clock → fires pause → setPlaying(false)
+Clock stops → no more timeupdate. currentTime stays ≈5 → readout sits at "0:05".
+```
+
+**4) Drag the seekbar to 1 minute**
+```
+Press the thumb    → onPointerDown → draft = currentValue (≈5)
+Drag               → onChange(60) → setDraft(60)   ← display shows 1:00 (draft overrides)
+                                    → onSeek(60) → el.currentTime = 60
+   browser jumps the playhead → fires timeupdate → setTime(60)
+   (more echoed timeupdates keep coming, but the draft holds the thumb put while you drag)
+Release the thumb  → onPointerUp → setDraft(null) → display falls back to currentTime (≈60)
+```
+Store now: `{ isPlaying:false, currentTime:60, duration:60 }`
+
+**5) Play again**
+```
+You click ▶ → togglePlay → video.play() → fires play → setPlaying(true)
+   stream of timeupdate resumes from 60 onward.
+```
+
+**The takeaway:** you act on the element (`play()`, `currentTime =`), the
+element's pipeline reports reality through events, your handlers translate
+those events into `dispatch`, and every subscribed view re-renders from the
+store. The store never drives playback — it always *reflects* it. Seeking
+"just" assigns `currentTime`; everything after that is the element
+re-reporting to the store.
+
+### Step 4 — Keyboard shortcuts
+(`features/player/hooks/usePlayerShortcuts.ts`, `playerSlice` `seekBy`,
+VideoPlayer seek bridge)
+
+**New concepts:** a global keydown listener; commands vs. mirrors in state;
+the seek command bridge.
+
+- **Where it lives:** a hook called once in `EditorShell`, so it's active
+  app-wide. It only ever `dispatch`es — it has no access to the `<video>`.
+- **Guard:** skip any key if focus is in an `INPUT`/`TEXTAREA`/`SELECT` or
+  `contentEditable`, so we never hijack the user's typing.
+- **Space = play/pause:** `dispatch(setPlaying(!isPlaying))`. It works *only when a video
+  is loaded* (`status === "ready"`), because opening the dialog on an empty
+  app would be annoying.
+- **←/→ = ±5s:** `dispatch(seekBy(±5))` (+0.1s with Shift). This is a
+  **command**, not a display update — the element owns the playhead.
+- **Ctrl/Cmd+O = open:** reuses the same `requestPick()` signal the menu uses.
+- **Command vs. mirror:** `setTime` is a *mirror* (written by `timeupdate`);
+   `seekBy` is a *command* (wants to move the element). The two must never be
+    confused, which is why seeking keeps separate `seekRequest`/`seekTime`
+    fields.
+
+**The seek bridge (store → element, matching `isPlaying`):**
+```tsx
+// slice:  seekBy(±5) → currentTime+seekTime=target, seekRequest+1
+// VideoPlayer effect:
+useEffect(() => {
+  if (seekRequest > 0) {
+    const video = videoRef.current!;
+    video.currentTime = seekTime;      // the actual move
+  }
+}, [seekRequest, seekTime]);
+```
+The element's `timeupdate` then echoes the new position back into `setTime`
+for the display. Same two-bridge idea as Step 3, now for seeking.
+
+### Step 5 — M3 verification pass
+
+The wiring was already done in Steps 1–4 (shortcuts in `EditorShell`, player
+in `PreviewPanel`), so Step 5 is the acceptance gate:
+
+- **Full production build:** `npm run build` → Go sidecar rebuild + Next
+  static export (TypeScript clean) + Rust release binary + MSI/NSIS
+  installers. All green.
+- **Live backend check:** started the freshly-built sidecar and hit
+  `GET /health` → `{status:"ok", app:"GuideForge Backend"}` and
+  `GET /version` → `{version:"0.1.0"}`.
+- **Pitfall surfaced again:** a stray `guideforge-backend.exe` (orphan from an
+  earlier killed `npm run dev`) was still holding port 3939, so the fresh
+  instance failed to bind — but the requests were answered by the living one,
+  proving the contract. Cleanup killed all `guideforge*` processes. Same
+  Windows force-kill orphan issue as M2 Step 7 (deferred fix lives in M10).
+
+**M3 acceptance met:** open an MP4 (menu, button, or Ctrl+O) → live preview →
+play/pause/seek (mouse + keyboard) → current time readout → UI never blocked
+(the element decodes off the UI thread).
+
 ## Appendix — file map (M2 so far)
 
 | File | Role |
@@ -354,6 +569,13 @@ start filling `status`/`sourceUrl` by opening a real file.
 | `frontend/features/layout/components/PreviewPanel.tsx` | center panel: video preview placeholder |
 | `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: placeholder message |
 | `frontend/features/layout/components/TimelinePanel.tsx` | bottom: ruler + empty track placeholder |
+| `frontend/features/player/playerSlice.ts` | player state + videoOpened/seekBy/setTime/… |
+| `frontend/features/player/playerSelectors.ts` | selectPlayer |
+| `frontend/features/player/formatTime.ts` | seconds → "m:ss" |
+| `frontend/features/player/components/VideoPicker.tsx` | hidden file input reacting to pickRequest |
+| `frontend/features/player/components/VideoPlayer.tsx` | owns `<video>`; event bridge + seek bridge |
+| `frontend/features/player/components/TransportBar.tsx` | play/pause, seekbar, time readout |
+| `frontend/features/player/hooks/usePlayerShortcuts.ts` | Space/arrows/Ctrl+O dispatch commands |
 
 **Retired in Step 6 (deleted):** `LayoutSizesDemo`, `LayoutPreview`,
 `HelloGuideForge`, `SystemStatusCard`. The app now boots directly into the
