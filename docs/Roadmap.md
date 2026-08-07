@@ -10,7 +10,7 @@ rotations (e.g. Wuthering Waves, Genshin, ZZZ).
 |---|-----------|------|--------|
 | 1 | Project Foundation | Tauri window + React + Redux + Go backend connected ("Hello GuideForge") | ✅ Done |
 | 2 | Layout System | Editor shell: menu bar, assets / preview / properties panels, timeline area | ⬜ Next |
-| 3 | Video Player | Open videos, play/pause, seek, current-time display | ⬜ |
+| 3 | Video Player | Open videos, play/pause, seek, current-time display | ✅ |
 | 4 | Timeline Engine | Custom timeline: playhead, drag, zoom, scroll | ⬜ |
 | 5 | Overlay Engine | Keyboard / mouse / arrow / text / image overlays on one interface | ⬜ |
 | 6 | Property Inspector | Opacity, scale, rotation, position, animation, duration | ⬜ |
