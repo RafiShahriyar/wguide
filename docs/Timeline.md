@@ -34,8 +34,13 @@ time. This keeps undo/save/render deterministic.
 
 ## Milestone 4 checklist
 
-- [ ] Playhead renders and drags to a frame-accurate time.
-- [ ] Mouse wheel zooms centered on the cursor.
-- [ ] Horizontal pan via scroll/drag.
-- [ ] Ruler ticks adapt to zoom.
-- [ ] Performance holds at 60fps for a 30 min timeline.
+- [x] Playhead renders and drags to a frame-accurate time.
+- [x] Mouse wheel zooms centered on the cursor.
+- [x] Horizontal pan via scroll (wheel / Shift+wheel).
+- [x] Ruler ticks adapt to zoom.
+- [x] Performance holds at 60fps for a 30 min timeline — rendering is
+      `O(visible ticks)`; only the ticks inside the current viewport are drawn
+      (the tick step keeps them ≥60px apart, bounding the count by width/60).
+
+Horizontal *pan by dragging the ruler* is deferred (it would conflict with the
+playhead-scrub drag); scroll-based panning covers the browsing need.

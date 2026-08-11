@@ -547,6 +547,671 @@ in `PreviewPanel`), so Step 5 is the acceptance gate:
 play/pause/seek (mouse + keyboard) → current time readout → UI never blocked
 (the element decodes off the UI thread).
 
+## Milestone 4 — Timeline Engine
+
+The timeline is a *viewport* onto the video's time axis. Everything is measured
+in **seconds** (absolute time); pixels are derived. `player.currentTime` stays
+the single source of truth for the playhead; a new `timeline` slice owns only
+the viewport (zoom + pan) — which is UI state, never saved.
+
+### Step 1 — `timelineSlice` + store registration
+(`features/timeline/timelineSlice.ts`, `timelineSelectors.ts`, `store.ts`)
+
+**New concepts:** a fourth slice; viewport state vs. data; zoom = px per second.
+
+- **Shape:** `{ zoom, viewportStart }`. `zoom` = how many *pixels one second*
+  occupies (bigger = more zoomed in). `viewportStart` = the second shown at the
+  left edge of the timeline (the pan position).
+- **Why zoom/pan live in Redux but are never saved:** they're *presentation*
+  — different users like different zoom. The project format stores absolute
+  time only. Viewport state is rebuilt from `DEFAULT_ZOOM` on open.
+- **Clamped:** `setZoom` clamps to `[4, 400]`; `panBy`/`setViewportStart` never
+  go below `0`. Reusing `clamp` from `utils/clamp`.
+- **Three small actions for now:** `setZoom`, `panBy(±s)`, `setViewportStart`
+  (direct). Steps 3–5 will consume them; Step 5 adds the anchored `zoomAt`.
+
+### Step 2 — Coordinate helpers (`features/timeline/timelineCoords.ts`)
+
+**New concepts:** pure math functions; the time↔pixel formulas; "nice" tick
+steps; float-drift avoidance.
+
+- **`timeToX(t, viewportStart, zoom)`** = `(t − viewportStart) * zoom` — where
+  a second appears on screen. **`xToTime(x, viewportStart, zoom)`** =
+  `viewportStart + x / zoom` — the inverse (what the cursor is pointing at).
+  Everything else in the timeline is built on these two.
+- **`tickStep(zoom, minPx = 60)`** — from a fixed list of "nice" steps
+  (`0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, …`), return the smallest step whose
+  pixels (`step * zoom`) meet a minimum label spacing. Zoomed way in → fine
+  ticks (0.1s); zoomed out → coarse ticks (60s). The ruler never crowds.
+- **`visibleTicks(...)`** — the actual second-values to draw across a viewport,
+  computed with `Math.ceil(start/step)` … `Math.floor(end/step)` and an
+  **integer loop counter** (`i * step`), so floating-point error can't
+  accumulate over a 30-minute timeline (that's why we don't do `t += step`).
+- **`r2`** — rounds to 2 decimals to hide artifacts like `0.30000000000000004`.
+- **Why pure:** no React, no store — pure functions are trivially testable and
+  reusable; the ruler and the playhead both call the same math, so they can
+  never disagree.
+
+**Worked micro-example (5s, zoom 40, viewport 0):**
+```
+timeToX(5, 0, 40)   → 200        (second 5 is 200px right of the left edge)
+xToTime(200, 0, 40) → 5          (200px in means second 5 — round trip works)
+tickStep(40)        → 2          (0.5→20px, 1→40px, 2→80px ≥ 60 → step = 2)
+visibleTicks(0, 500, 40) → [0, 2, 4, 6, 8, 10]  (every 2s across 12.5s of view)
+```
+
+### Step 3 — The `Timeline` component
+(`features/timeline/components/Timeline.tsx`, `TimelinePanel.tsx` slimmed to a
+slot)
+
+**New concepts:** three-layer timeline; measuring width with
+`useLayoutEffect` + `ResizeObserver`; "the playhead is a view of the video
+clock, the ruler is a view of zoom."
+
+The component draws three layers in one relative container: an adaptive
+**ruler** (ticks + labels), an empty **tracks** area (M5), and an absolute
+**playhead** line spanning both. Every pixel position is `timeToX(...)` — one
+formula, one truth.
+
+**Read path:**
+```tsx
+const { currentTime } = useAppSelector(selectPlayer);       // the video's clock
+const { zoom, viewportStart } = useAppSelector(selectTimeline);
+const ticks     = visibleTicks(viewportStart, width, zoom);
+const playheadX = timeToX(currentTime, viewportStart, zoom);
+```
+Two responsibilities: *what time is it* (from `player`, driven by the element
+— M3) and *how zoomed/panned* (from `timeline`, viewport only).
+
+**Width measurement:** `width` starts at 0; `useLayoutEffect` measures
+**before paint** (no empty-ruler flicker); `ResizeObserver` re-measures on any
+size change (divider drag, window resize).
+
+**Worked example (60s video, zoom 40 px/s, viewportStart 0, timeline 800px):**
+```
+A) The ruler draws itself:
+     tickStep(40): 0.5→20px, 1→40px, 2→80px ≥ 60 → step = 2
+     end = 0 + 800/40 = 20s → ticks [0, 2, 4, …, 20], each at (t−0)*40 px
+B) Press play → timeupdate mirrors currentTime=5 → playheadX = 5*40 = 200px
+   The red line glides every timeupdate (~15–250ms) — no extra code.
+C) Pause, drag the timeline divider wider → ResizeObserver → width=1200
+   → ticks now [0, 2, …, 30]; playhead stays at second 5 (same time, more room).
+```
+**Pitfall (TS, same as M3):** `rulerRef.current` is nullable; the narrowing
+from `if (!el) return` is lost inside the `ResizeObserver` callback closure.
+Fix: `const el = rulerRef.current!`.
+
+### Step 4 — Playhead drag to seek
+(`Timeline.tsx` pointer handlers, `playerSlice.seekTo`)
+
+**New concepts:** the absolute seek command; screen coordinates vs. local
+coordinates; pointer capture on the timeline.
+
+- **`seekTo(seconds)`** — absolute sibling of M3's relative `seekBy`. Same
+  command bridge (`seekTime` + `seekRequest`); `VideoPlayer` applies it to the
+  element. Reuses everything from M3.
+- **`scrubbing` is a ref, not state** — flipping a boolean we don't render must
+  not re-render the whole timeline every pointermove.
+- **`xToTime` is the exact inverse of the playhead's `timeToX`** — that
+  symmetry is why clicks always land under the cursor.
+
+**Worked example (zoom 40, viewportStart 0, paused at 3s, want second 10):**
+```
+1. Click at 400px from the timeline's left edge.
+2. scrubTo: localX = clientX − rect.left = 400
+   → xToTime(400, 0, 40) = 400/40 = 10s
+3. dispatch(seekTo(10)) → currentTime=10, seekTime=10, seekRequest+1
+4. VideoPlayer effect → video.currentTime = 10      (element jumps)
+5. timeupdate echoes → setTime(10) → store mirrors back
+6. Playhead re-renders at timeToX(10, 0, 40) = 400px — under your cursor
+```
+Dragging (even while playing) re-runs 2–6 on every `pointermove`, live-scrubbing
+the video; pointer capture keeps the drag alive outside the element.
+
+**Safety:** `seekTo` clamps to `[0, duration]`; the handlers are gated on
+`status === "ready"`.
+
+### Step 5 — Zoom on wheel + horizontal pan
+(`timelineSlice.zoomAt`, `Timeline.onWheel`)
+
+**New concepts:** anchored (cursor-centered) zoom; viewport re-alignment math;
+wheel = pan vs. zoom.
+
+- **Anchored zoom:** naive zoom pivots about the left edge; proper editors zoom
+  about the cursor. So:
+  ```
+  anchorTime = viewportStart + anchorX / oldZoom   // second under cursor (before)
+  newZoom    = clamp(zoom * factor)                 // zoom
+  viewportStart = anchorTime − anchorX / newZoom    // re-align so it stays put
+  ```
+- **Wheel routing:** horizontal delta (or Shift held) → `panBy(deltaX / zoom)`
+  (px → seconds). Vertical delta → `zoomAt({ factor, anchorX })` with
+  `factor = 1.0015 ** −deltaY` (smooth curve).
+- **Pure viewport math:** zoom/pan only touch `timeline` state — the video,
+  playhead, and clips (absolute time) are untouched. Data vs. view stays
+  clean, per the ProjectFormat "absolute times only" rule.
+
+**Worked example (zoom 40, viewportStart 0, cursor at 200px, on "0:05"):**
+```
+Zoom in (factor 1.2):
+  anchorTime = 0 + 200/40 = 5
+  newZoom = 48;  viewportStart = 5 − 200/48 ≈ 0.83
+  Check: timeToX(5, 0.83, 48) = (5−0.83)·48 = 200px ✓ pinned to cursor
+
+Pan right 240px:
+  panBy(240/40 = 6) → viewportStart = 6  (window now shows from second 6)
+  Playhead at 5s moves to timeToX(5, 6, 40) = −40px → off-screen left, but the
+  video is untouched — only the view moved.
+```
+
+### Step 6 — M4 verification pass
+
+- **Full production build:** green — Go sidecar, Next static export + TypeScript,
+  Rust release binary, MSI/NSIS installers.
+- **Acceptance met:** playhead renders + drags to a second, wheel zooms toward
+  the cursor, ruler ticks adapt to zoom, horizontal scroll pans, and the whole
+  thing stays smooth because rendering is `O(visible ticks)` (only the ticks
+  currently on screen are drawn — the ≥60px step bounds the count).
+- Deferred: pan-by-dragging the ruler (would fight the scrub-drag); tooltips;
+  a zoom-to-fit button.
+
+**The whole M4 in one line:** the video's own clock (via `player.currentTime`)
+feeds the playhead; the `timeline` slice only holds *how you look* (zoom + pan);
+`timeToX`/`xToTime` are the only bridge between the two.
+
+## Milestone 5 — Overlay Engine
+
+Put *things* on the time axis: overlay clips (keyboard, text) that appear as
+**blocks on lanes** and as **drawn labels on the preview** while the playhead
+is inside them.
+
+### Step 1 — The clip/track model
+(`features/timeline/types.ts`, `timelineSlice.ts`)
+
+**New concepts:** the data model; discriminated unions; reducers that mint ids
+and patch nested objects.
+
+- **Types** (`types.ts`): `OverlayClip { id, kind, name, start, duration, props }`
+  — all time absolute seconds. `props` is a **discriminated union**: `kind` is
+  the discriminant. `"keyboard"` → `{ keys }`; `"text"` → `{ text, color }`.
+  `Track { id, name, clips }`. No pixels anywhere — M9 will serialize this.
+- **The slice now has data + view** (both concerns): `zoom`/`viewportStart`
+  for the view, `tracks` + `selectedClipId` for the content.
+- **`addClip`** mints the id via `crypto.randomUUID()` *inside the reducer*
+  (this is the standard RTK pattern — callers just send the content), pushes
+  onto the first track and auto-selects. `updateClip` applies a `ClipPatch`
+  (every field optional); `deleteClip` filters it out and clears selection.
+- **`findClip`** — tiny pure reducer helper so `updateClip`/`deleteClip`
+  don't repeat the search loop.
+
+**Worked example — the user adds their first note:**
+```
+You click "+ Add" (Step 4) → dispatch(addClip({
+  kind:"text", name:"Echo!", start:12, duration:3,
+  props:{ text:"Echo up", color:"#ffffff" } }))
+  → reducer: clip = { id:"5f4…", …payload }  →  tracks[0].clips.push(clip)
+  → selectedClipId = "5f4…"
+Store: tracks = [ { name:"Overlays", clips:[ { id:"5f4…", kind:"text", start:12,
+         duration:3, props:{…} } ] } ], selectedClipId:"5f4…"
+```
+The plan: Steps 2–3 render that clip as a lane block + preview label; Step 4
+builds the "+ Add" button.
+
+## M4.5 — Viewport limits (interlude)
+
+Found while testing a real 22-minute recording: **only the first ~8 minutes were
+reachable.** Not a bug in the formulas — an arithmetic collision between two
+constants.
+
+### Step 1 — Duration-aware zoom floor, right-hand pan clamp, Fit button
+(`timelineCoords.ts`, `timelineSlice.ts`, `components/Timeline.tsx`)
+
+**The diagnosis.** Visible span is always `width / zoom`. The old floor was a
+hardcoded `ZOOM_MIN = 4`, and the timeline row spans the whole window (~1900px):
+
+```
+1900 px ÷ 4 px/s = 475 s = 7 min 55 s   ← the "8 minutes"
+```
+
+To fit 1320 s you need `1900/1320 = 1.44` px/s — below the floor, so the clamp
+silently refused. Second bug: `panBy` only had `Math.max(0, …)`, i.e. a **left**
+guard rail and no **right** one, so you could pan to second 9000 of a 1320-second
+video and stare at an empty grid.
+
+**New concepts:**
+
+- **A limit can depend on data another slice owns.** `duration` lives in the
+  *player* slice; `width` is measured from the *DOM*. The timeline reducer can
+  see neither — and must stay pure, so it can't go looking. Three ways out:
+  1. duplicate `duration` into the timeline slice (two copies of one truth — no)
+  2. use a thunk that reads `getState()` (works, but hides the dependency)
+  3. **make the caller pass it in the payload** ← chosen
+  So every viewport action now carries `bounds: { duration, width }`. The
+  dependency becomes visible in the type signature, and the reducer stays a
+  pure function of `(state, action)`.
+- **Derived limits, not stored ones.** `minZoomFor(bounds)` and
+  `maxViewportStart(bounds, zoom)` are pure functions computed on demand. Nothing
+  is cached, so nothing can go stale when the window resizes.
+- **The two limits agree by construction.** `minZoom = width/duration`, and at
+  that zoom `maxViewportStart = duration − width/(width/duration) = 0`. Fully
+  zoomed out therefore *always* means "pinned at 0:00, whole video on screen" —
+  we didn't have to special-case that, the algebra produces it.
+- **Idempotent repair action.** `clampViewport` doesn't change a legal viewport;
+  it only drags an illegal one back in range. That makes it safe to fire from an
+  effect on every width change without guarding.
+- **Effect that must NOT re-run its main job.** The same effect fits a *new*
+  video and re-clamps everything else. `fittedFor` (a ref holding the last
+  `sourceUrl` we fitted) is the latch — otherwise every window resize would reset
+  the user's zoom. A ref, not state, because changing it must not re-render.
+
+**Worked example — opening the 22-minute file (panel 1900px):**
+```
+videoOpened → sourceUrl="blob:…9c2"     (duration still 0)
+<video> loadedmetadata → setDuration(1320)
+  → Timeline re-renders; effect deps [sourceUrl, duration, width] changed
+  → fittedFor.current (null) !== "blob:…9c2"  → dispatch(fitToWindow(bounds))
+  → minZoomFor({1320, 1900}) = 1900/1320 = 1.44 px/s
+Store: zoom = 1.44, viewportStart = 0
+Ruler: tickStep(1.44) → first step with step*1.44 ≥ 60 is 60 → a label a minute
+Result: 0:00 … 22:00 all on screen at once.
+```
+Then you wheel-zoom in on 15:00 and shift-scroll right to the end:
+```
+panBy({ seconds: +400, bounds })  with zoom=40
+  → clampStart(1200+400, 40, bounds)
+  → maxViewportStart = 1320 − 1900/40 = 1320 − 47.5 = 1272.5
+  → viewportStart = 1272.5   (not 1600 — the end sticks to the right edge)
+```
+
+**Pitfalls hit:**
+
+- `clamp(v, min, max)` misbehaves if `min > max`, so `minZoomFor` clamps its own
+  result into `[0.5, 400]` before it is ever used as a lower bound.
+- The **Fit** button sits inside the ruler, whose parent owns `onPointerDown`
+  for playhead scrubbing. Without `onPointerDown={e => e.stopPropagation()}` the
+  click would fit *and* seek the video to wherever the button happens to be.
+- No video open (`duration = 0`) or not yet measured (`width = 0`) means we don't
+  know the limits — `hasBounds()` gates that and falls back to the old `4` px/s
+  rather than dividing by zero.
+
+**Still deferred to M10:** `Ctrl+0` for Fit (needs the measured width inside a
+hook), pan-by-dragging the ruler, and a scrollbar/overview strip.
+
+### Step 2 — Clips as lane blocks
+(`timelineCoords.ts`, `components/ClipBlock.tsx`, `components/Timeline.tsx`)
+
+**New concepts:** rendering data through the coordinate system; presentational
+("dumb") components; `Record<Union, T>` as an exhaustive lookup; culling; event
+propagation between overlapping click targets.
+
+- **`clipRect(start, duration, viewportStart, zoom)`** — the second half of the
+  time→pixel story. `x` is just `timeToX(start)`; `width` is `duration * zoom`,
+  the same px-per-second conversion applied to a *length* instead of a *point*.
+  Kept pure in `timelineCoords` because M7's drag/resize needs the identical
+  numbers.
+- **`MIN_CLIP_WIDTH = 4`** — a 0.2s clip at 1.44 px/s is 0.29px: invisible and
+  unclickable. We widen the **drawing** only; `clip.duration` is never touched.
+  Cosmetics must not leak into data (the ProjectFormat rule again).
+- **`isRectVisible`** — same culling idea as `visibleTicks`. A guide with 500
+  overlays still only builds DOM for the few on screen.
+- **`ClipBlock` is presentational.** It does no math and reads nothing from the
+  store — the parent computes `x`/`width` and passes them down. All coordinate
+  logic stays in one file instead of spreading through the tree.
+- **`KIND_STYLES: Record<OverlayKind, string>`** — a lookup, not an if/else.
+  `Record` over a union is *exhaustive*: the day we add `"arrow"` to
+  `OverlayKind`, TypeScript errors here until we give it a colour. The compiler
+  becomes the to-do list.
+- **Lanes are absolutely positioned by index** (`top: i * TRACK_HEIGHT`), so
+  track order = vertical order = the z-order the renderer will use in M8.
+
+**Worked example — the seed keyboard clip at 22:00-video zoom:**
+```
+clip = { start: 4, duration: 2, kind:"keyboard", name:"Q → E swap" }
+viewport after Fit: zoom = 1.44 px/s, viewportStart = 0
+
+clipRect(4, 2, 0, 1.44)
+  x     = (4 - 0) * 1.44          = 5.76 px
+  width = max(2 * 1.44, 4) = max(2.88, 4) = 4 px   ← the minimum kicked in
+isRectVisible({5.76, 4}, 1900) → 5.76+4 ≥ 0 and 5.76 ≤ 1900 → true
+→ <button style="left:5.76px; width:4px"> — a visible sliver
+
+Now wheel-zoom to 60 px/s, viewportStart = 3:
+  x     = (4 - 3) * 60 = 60 px
+  width = max(2 * 60, 4) = 120 px      ← readable block, label fits
+```
+Nothing in the store changed between those two — only `zoom`/`viewportStart`.
+The clip data was identical both times.
+
+**Worked example — clicking a clip:**
+```
+pointerdown on ClipBlock
+  → event.stopPropagation()          (parent's onPointerDown never runs)
+  → dispatch(selectClip("seed-keys"))
+Store: selectedClipId = "seed-keys"
+  → Timeline re-renders → that block gets `ring-1 ring-white/80`
+  → video does NOT seek, scrubbing.current stays false
+
+pointerdown on empty lane space
+  → parent's onPointerDown runs → dispatch(selectClip(null)) + scrub begins
+Store: selectedClipId = null, and seekTo(xToTime(...)) fires
+```
+Two overlapping click targets, one rule deciding which wins: whoever stops
+propagation first.
+
+**Pitfalls hit:**
+
+- Forgetting `stopPropagation` makes every clip click *also* jerk the playhead
+  to that spot — the clip appears to "work" but the video jumps.
+- `<button>` was chosen over `<div>` deliberately: keyboard focus and Enter come
+  free, which M6's inspector will want.
+- **Temporary scaffolding:** `SEED_CLIPS` in `timelineSlice.ts` exists only so
+  Step 2 has something to draw. **Step 4 deletes it** and restores `clips: []`.
+
+**Deferred:** a track-name gutter on the left (it would shift x=0 away from
+`viewportStart` and complicate every coordinate call), and drag/resize (M7).
+
+### Step 3 — Preview overlay
+(`types.ts` **rewritten**, `timelineSlice.ts`, `activeClips.ts`,
+`components/OverlayCanvas.tsx`, `player/components/VideoPlayer.tsx`)
+
+**New concepts:** a *real* discriminated union; half-open intervals; measuring
+one element to position another; two features meeting in one component.
+
+#### The pitfall that forced a type rewrite
+
+Step 1's model *said* discriminated union but wasn't one:
+
+```ts
+interface OverlayClip { kind: OverlayKind; props: KeyboardProps | TextProps }
+//  ↑ kind and props are two unrelated fields that happen to sit together
+if (clip.kind === "keyboard") clip.props.keys   // ❌ error: no `keys` on the union
+```
+
+TypeScript narrows a **union of types**, not a field inside one interface.
+Checking `kind` told it nothing about `props`. Fixed by moving the union to the
+top level:
+
+```ts
+interface KeyboardClip extends ClipBase { kind: "keyboard"; props: KeyboardProps }
+interface TextClip     extends ClipBase { kind: "text";     props: TextProps }
+type OverlayClip = KeyboardClip | TextClip;   // ← the union lives HERE
+if (clip.kind === "keyboard") clip.props.keys   // ✅ narrowed
+```
+
+The rule: **the discriminant must be a literal type on each member of a union.**
+Now `{ kind: "text", props: { keys: [...] } }` is not merely wrong, it is
+*unrepresentable* — the compiler refuses to build it.
+
+Knock-on changes:
+- `AddClipPayload` → `NewOverlayClip = Omit<KeyboardClip,"id"> | Omit<TextClip,"id">`,
+  so the kind↔props pairing survives the trip through the action.
+- `addClip` collapsed to `{ id: crypto.randomUUID(), ...action.payload }`.
+- `updateClip` can no longer just assign `patch.props` — the compiler now
+  demands proof the props match *this* clip's kind. The `in` operator supplies
+  it (`"keys" in patch.props`), narrowing both sides at once; a mismatched patch
+  is ignored instead of corrupting the clip.
+
+#### Half-open intervals (`activeClips.ts`)
+
+`isClipActive` uses `time >= start && time < start + duration` — **`[start, end)`**.
+With clips at 0–2s and 2–4s, `<=` would call both live at exactly 2.000s and
+flash two overlays for one frame. With `<`, second 2.000 belongs to exactly one.
+
+`activeClipsAt(tracks, time)` walks tracks in order, so the returned array is
+already in draw order (bottom track first) — the same z-order M8 will export.
+Both functions are pure and React-free *on purpose*: the renderer must be able
+to ask the identical question per frame and get the identical answer.
+
+#### Anchoring the overlay to the video, not the panel
+
+The `<video>` is centred in a black box with `max-h-full max-w-full`, so a 16:9
+clip in a wide panel leaves bars at the sides. Anchoring overlays to the panel
+would float them over those bars — and M8, which knows only the video frame,
+would disagree with what the editor showed. So `OverlayCanvas` measures the
+video's own box (`offsetLeft/Top/Width/Height`, relative to the `relative`
+parent) and positions itself to match.
+
+**Two** ResizeObservers, because the two things change independently: the video
+resizes when metadata loads or the panel gets taller, but it *slides sideways*
+when the panel width changes while its own size stays put (it's centred). Only
+watching the video would miss the slide.
+
+**Worked example — scrubbing onto a clip:**
+```
+seed clip: { kind:"keyboard", start:4, duration:2, props:{ keys:["Q","E"] } }
+
+you drag the playhead to 3.9s
+  → seekTo(3.9) → element seeks → timeupdate → setTime(3.9)
+  → OverlayCanvas re-renders: activeClipsAt(tracks, 3.9)
+       3.9 >= 4 ? no  → []  → component returns null, nothing drawn
+
+you drag on to 4.2s
+  → activeClipsAt(tracks, 4.2): 4.2 >= 4 ✓ and 4.2 < 6 ✓ → [seed-keys]
+  → OverlayItem: clip.kind === "keyboard" → props narrowed to KeyboardProps
+  → two keycaps "Q" "E" render at the bottom-centre of the video box
+
+you drag to 6.0s
+  → 6.0 < 6 is false → [] → overlay disappears (half-open in action)
+```
+
+**Pitfalls hit:**
+
+- The container needed `relative` added. Without a positioned ancestor,
+  `offsetLeft` measures from some far-up element and the overlay lands nowhere
+  near the video.
+- `pointer-events-none` on the canvas, or overlays would eat clicks aimed at
+  the video.
+- **Known limitation:** `currentTime` is mirrored from the `timeupdate` event,
+  which browsers fire only ~4×/second. During playback an overlay can appear or
+  vanish up to ~250ms late. Fine for editing (you scrub, and scrubbing is
+  exact); M8's export won't have the problem at all because it asks
+  `activeClipsAt` per frame. A `requestAnimationFrame` mirror is the M10 fix.
+
+**Deferred:** per-clip x/y position, size, and font (the model has no geometry
+yet — overlays stack bottom-centre); mouse/arrow/image kinds.
+
+### Step 4 — Add an overlay at the playhead
+(`newClip.ts`, `components/TimelineToolbar.tsx`, `components/Timeline.tsx`,
+`timelineSlice.ts`)
+
+**New concepts:** defaults as a pure factory; layout that removes an event
+problem instead of patching it; "pass only what the store can't know".
+
+- **`makeNewClip(kind, start, videoDuration)`** — a pure factory returning
+  `NewOverlayClip`. Defaults live here, not in the button's onClick, because
+  Step 5's duplicate/paste and M7 will want the same answer to "what does a new
+  overlay look like?". It also trims `duration` against the remaining video so
+  adding at 21:59 of a 22:00 clip doesn't create an overlay hanging past the
+  end.
+- **`TimelineToolbar` takes exactly one prop: `width`.** Everything else
+  (`currentTime`, `duration`, `status`) it reads from the store itself. The
+  rule that falls out: *pass down only what the store cannot know* — and the
+  measured panel width is the one such number in this component.
+- **`SEED_CLIPS` deleted**, `clips: []` restored, as promised in Step 2. The
+  empty lane now shows a hint instead of looking broken.
+
+#### Layout as a bug fix
+
+Step 2 put the Fit button *inside* the pointer-handling root, which forced
+`onPointerDown={e => e.stopPropagation()}` so clicking it didn't also scrub. Two
+more buttons would have meant repeating that hack three times. Instead the
+toolbar moved **outside** the root:
+
+```
+<div flex-col>                 ← no handlers
+  <TimelineToolbar/>           ← buttons live here, can't reach the scrub logic
+  <div ref={rootRef} onPointerDown onWheel …>   ← ruler + lanes + playhead
+```
+
+`rootRef` now measures this inner box, so `width` still means "the width clips
+are drawn in", and the playhead's `inset-y-0` no longer runs up through the
+toolbar. **When you find yourself repeating `stopPropagation`, the layout is
+usually the thing that's wrong.**
+
+**Worked example — adding a keycap overlay at 4.2s:**
+```
+Playhead is at currentTime = 4.2 (video duration 1320). You click "+ Keys".
+
+TimelineToolbar.add("keyboard")
+  → makeNewClip("keyboard", 4.2, 1320)
+      remaining = 1320 − 4.2 = 1315.8
+      duration  = max(0.5, min(2, 1315.8)) = 2
+      → { kind:"keyboard", name:"Q", start:4.2, duration:2, props:{keys:["Q"]} }
+  → dispatch(addClip(thatObject))
+
+timelineSlice.addClip
+  → clip = { id: crypto.randomUUID() → "8b1e…", ...payload }
+  → tracks[0].clips.push(clip)
+  → selectedClipId = "8b1e…"        ← auto-selected, ready for Step 5
+
+re-render, with zoom = 60, viewportStart = 3:
+  Timeline  → clipRect(4.2, 2, 3, 60) → x = 72, width = 120
+              → ClipBlock at left:72px, with a ring (it is selected)
+  Overlay   → activeClipsAt(tracks, 4.2): 4.2 >= 4.2 ✓ and 4.2 < 6.2 ✓
+              → a "Q" keycap appears on the video INSTANTLY
+```
+That last line is the payoff of the half-open interval from Step 3: because the
+range is `[start, end)` and `start` *is* the current time, a clip added at the
+playhead is live the moment it exists. A closed-on-the-left interval would have
+required nudging the playhead before you could see what you just made.
+
+**Pitfalls hit:**
+
+- The new clip's `start` is `currentTime` — **seconds, from the player's clock**.
+  It is tempting to derive it from the playhead's pixel position; that would
+  make the result depend on zoom and re-introduce rounding. Data comes from
+  data.
+- `duration` in `TimelineToolbar` means the *video's* length, while
+  `clip.duration` means the *overlay's* length. Same word, two meanings — worth
+  reading carefully in `makeNewClip`'s signature.
+
+**Deferred:** deleting a clip from the UI (the `deleteClip` reducer exists but
+nothing dispatches it yet — Step 5 adds the button), and overlap handling (two
+clips at the same second both render, stacked).
+
+### Step 5 — Editing a clip's properties
+(`components/ClipInspector.tsx`, `layout/components/PropertiesPanel.tsx`,
+`timelineSelectors.ts`, `timelineSlice.ts`, `newClip.ts`)
+
+**New concepts:** derived selectors; controlled inputs; where invariants belong;
+the one case where a local draft beats the store.
+
+- **`selectSelectedClip`** — a *derived* selector. The store keeps only an id;
+  this walks the tracks and returns the clip it names. No memoisation needed,
+  because it returns the object already living in the store — the same
+  reference every call until that clip really changes, which is exactly what
+  React's re-render check compares.
+- **Controlled inputs.** Each field's `value` comes from the store and its
+  `onChange` dispatches `updateClip`; the resulting re-render puts the new
+  value back in the box. There is no second copy of the truth, so the timeline
+  block, the preview overlay and the form can never disagree.
+- **Invariants moved into the reducer.** `updateClip` now applies
+  `Math.max(0, start)` and `Math.max(MIN_CLIP_DURATION, duration)`. The form
+  could have clamped, but then M7's drag and M9's file loader would each have
+  to remember to clamp too. **A rule that must always hold belongs where the
+  data changes, not where the UI happens to change it.**
+- **The panel doesn't own the form.** `PropertiesPanel` only asks "is anything
+  selected?" and delegates; `ClipInspector` lives in `features/timeline/`
+  beside the data it edits.
+
+#### The one place a local draft is correct
+
+Keys are `string[]` in the data but one comma-separated line in the input. Read
+straight from the store, typing `"Q, "` round-trips `["Q"]` → `"Q"` and the
+browser eats your comma and space mid-keystroke.
+
+So `KeysField` keeps the raw text in `useState` and dispatches the *parsed*
+array. The re-seeding effect depends on **`clip.id` only** — depending on the
+keys themselves would overwrite what you are typing on every keystroke.
+
+The general shape: **raw keystrokes are UI state; the parsed value is data.**
+Reach for it only when the two genuinely differ — `name` and `text` need no
+draft because the string in the box *is* the string in the store.
+
+**Worked example — retiming an overlay:**
+```
+Selected clip: { id:"8b1e…", start:4.2, duration:2 }, viewport zoom = 60, vs = 3
+You select the Length box and type 3.5
+
+onChange("3.5") → patchNumber("duration", "3.5")
+  → dispatch(updateClip({ id:"8b1e…", patch:{ duration: 3.5 } }))
+  → reducer: findClip → clip.duration = max(0.5, 3.5) = 3.5
+
+one dispatch, three views update from the same fact:
+  ClipBlock       clipRect(4.2, 3.5, 3, 60) → width 120 → 210px, block grows
+  OverlayCanvas   live window was [4.2, 6.2) → now [4.2, 7.7)
+  ClipInspector   the Length box re-renders showing 3.5
+```
+
+**Pitfalls hit:**
+
+- `Number("")` is `0`, so clearing a number box would silently retime the clip
+  to 0:00. `patchNumber` ignores blank input instead.
+- Typing `-` in a number box parses as `NaN`; `Number.isFinite` filters it, and
+  the reducer's `Math.max(0, …)` catches genuine negatives.
+- `KeysField` is typed `KeyboardClip`, not `OverlayClip` — the parent already
+  narrowed via `clip.kind === "keyboard"`, so the child can state the stronger
+  type and skip re-checking.
+
+**Deferred:** undo/redo (M10), editing `name` and keys as separate concepts
+(right now a new keycap clip is named after its key but they drift once edited),
+and per-clip position/size (needs geometry in the model).
+
+### Step 6 — M5 verification pass
+
+**New concepts:** what "verified" means with no test framework; reading your own
+code for invariants instead of for bugs.
+
+With no test runner in this project, a milestone is verified by four things:
+typecheck, the full production build, a manual click-through, and a live backend
+check. Each catches a different class of problem — and none of them catches the
+others' class, which is why all four are on the list.
+
+| Gate | Catches |
+|------|---------|
+| `npm --prefix frontend run build` | type errors, bad imports, export failures |
+| `npm run build` (full) | Go compile, Rust release compile, bundler/installer |
+| manual checklist | anything about *behaviour* — the only gate that watches |
+| `curl /health` | the sidecar still starts and answers |
+
+#### The manual checklist for M5
+
+1. Open a video → the timeline fits the whole thing, ruler labelled sensibly.
+2. Park the playhead, click **+ Keys** → a green block appears at that second,
+   already ringed (selected), and a `Q` keycap shows on the video immediately.
+3. Scrub before the block → keycap disappears. Scrub inside → it returns.
+   Scrub to exactly `start + length` → it disappears (half-open interval).
+4. Click **+ Text** at a different second → a blue block; edit Text and Colour
+   in Properties and watch the video update as you type.
+5. Type `Q, E, Shift` into Keys → three keycaps; the commas survive typing.
+6. Change **Length** → the block grows/shrinks and the overlay lasts longer.
+7. Click a block → it selects and the video does **not** jump. Click empty lane
+   space → it deselects and the playhead **does** move.
+8. Zoom and pan → blocks stay aligned with the ruler; **Fit** shows everything.
+9. **Delete** → the block, the overlay and the form all clear together.
+10. Reload → everything is gone. *Expected*: persistence is M9.
+
+#### What re-reading the code turned up
+
+Three things worth writing down, none of them crashes:
+
+- **`clip.start` is never clamped against the video's length.** You can retime
+  an overlay to second 5000 of a 1320-second video. It is harmless now (nothing
+  renders it, the timeline pan clamp keeps you from even looking at it) but M6
+  should fix it, because M8 would happily export a clip nobody can see.
+- **Two clips at the same second both render, stacked.** That is arguably
+  correct — a keycap *and* a caption at once is a real thing a guide wants —
+  but there is no z-order control beyond track order yet.
+- **`fittedFor` keys on `sourceUrl`**, and `URL.createObjectURL` mints a fresh
+  URL every open. So re-opening the *same file* refits the view. Correct
+  behaviour, arrived at by accident rather than design — worth knowing before
+  someone "optimises" it to key on the file name.
+
+**The lesson about the gates:** the frontend build passed after every single
+step of M5, and it would have passed just as happily if the half-open interval
+had been `<=` and every overlay flickered at its boundary. Types check
+*structure*; only the checklist checks *meaning*.
+
 ## Appendix — file map (M2 so far)
 
 | File | Role |
@@ -567,7 +1232,8 @@ play/pause/seek (mouse + keyboard) → current time readout → UI never blocked
 | `frontend/features/layout/layoutSelectors.ts` | selectPanels |
 | `frontend/features/layout/components/AssetsPanel.tsx` | left panel: placeholder asset list |
 | `frontend/features/layout/components/PreviewPanel.tsx` | center panel: video preview placeholder |
-| `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: placeholder message |
+| `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: renders ClipInspector for the selected clip |
+| `frontend/features/timeline/components/ClipInspector.tsx` | edit form for the selected clip: name, start, length, per-kind props, delete |
 | `frontend/features/layout/components/TimelinePanel.tsx` | bottom: ruler + empty track placeholder |
 | `frontend/features/player/playerSlice.ts` | player state + videoOpened/seekBy/setTime/… |
 | `frontend/features/player/playerSelectors.ts` | selectPlayer |
@@ -576,6 +1242,16 @@ play/pause/seek (mouse + keyboard) → current time readout → UI never blocked
 | `frontend/features/player/components/VideoPlayer.tsx` | owns `<video>`; event bridge + seek bridge |
 | `frontend/features/player/components/TransportBar.tsx` | play/pause, seekbar, time readout |
 | `frontend/features/player/hooks/usePlayerShortcuts.ts` | Space/arrows/Ctrl+O dispatch commands |
+| `frontend/features/timeline/timelineSlice.ts` | viewport (zoom, viewportStart) + clip data; setZoom/panBy/zoomAt/fitToWindow/clampViewport, addClip/selectClip/updateClip/deleteClip |
+| `frontend/features/timeline/timelineSelectors.ts` | selectTimeline / selectZoom / selectViewportStart / selectTracks / selectSelectedClipId |
+| `frontend/features/timeline/timelineCoords.ts` | pure timeToX / xToTime / tickStep / visibleTicks + viewport limits (minZoomFor / maxViewportStart) |
+| `frontend/features/timeline/types.ts` | overlay data model: KeyboardClip \| TextClip union, Track, ClipPatch (absolute seconds) |
+| `frontend/features/timeline/activeClips.ts` | pure isClipActive / activeClipsAt — which overlays are live at second T |
+| `frontend/features/timeline/newClip.ts` | pure makeNewClip — defaults for a freshly added overlay |
+| `frontend/features/timeline/components/TimelineToolbar.tsx` | + Keys / + Text at the playhead, and Fit |
+| `frontend/features/timeline/components/OverlayCanvas.tsx` | draws the live overlays on the video preview; measures the video box |
+| `frontend/features/timeline/components/Timeline.tsx` | ruler + track lanes + playhead; scrub-drag, wheel zoom/pan, Fit; TimelinePanel renders it |
+| `frontend/features/timeline/components/ClipBlock.tsx` | one overlay drawn as a block; presentational, colour per kind, click to select |
 
 **Retired in Step 6 (deleted):** `LayoutSizesDemo`, `LayoutPreview`,
 `HelloGuideForge`, `SystemStatusCard`. The app now boots directly into the
