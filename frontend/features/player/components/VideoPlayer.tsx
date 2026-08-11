@@ -10,6 +10,7 @@ import {
   setTime,
 } from "@/features/player/playerSlice";
 import { selectPlayer } from "@/features/player/playerSelectors";
+import { OverlayCanvas } from "@/features/timeline/components/OverlayCanvas";
 import { TransportBar } from "./TransportBar";
 
 export function VideoPlayer({ sourceUrl }: { sourceUrl: string }) {
@@ -102,8 +103,11 @@ export function VideoPlayer({ sourceUrl }: { sourceUrl: string }) {
 
   return (
     <div className="flex min-h-0 h-full flex-col bg-zinc-950">
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-black">
+      {/* `relative` makes this the positioning parent the OverlayCanvas
+          measures against, so the overlays land on the video, not the bars. */}
+      <div className="relative flex min-h-0 flex-1 items-center justify-center bg-black">
         <video ref={videoRef} className="max-h-full max-w-full object-contain" />
+        <OverlayCanvas videoRef={videoRef} />
       </div>
       <TransportBar onTogglePlay={togglePlay} onSeek={seekTo} />
     </div>

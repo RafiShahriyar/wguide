@@ -88,6 +88,14 @@ const playerSlice = createSlice({
       state.seekTime = target;
       state.seekRequest += 1;
     },
+    // Jump the playhead to an ABSOLUTE second (used by playhead drag / click).
+    // Same command bridge as seekBy.
+    seekTo(state, action: PayloadAction<number>) {
+      const target = clamp(action.payload, 0, state.duration || 0);
+      state.currentTime = target;
+      state.seekTime = target;
+      state.seekRequest += 1;
+    },
   },
 });
 
@@ -99,6 +107,7 @@ export const {
   setTime,
   setDuration,
   seekBy,
+  seekTo,
 } = playerSlice.actions;
 
 export default playerSlice.reducer;
