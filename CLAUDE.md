@@ -82,8 +82,9 @@ Milestones (see `docs/Roadmap.md`, table):
 - ✅ **M5 Overlay Engine** — all 6 steps done: 1) clip/track model
   2) lane blocks 3) preview overlay 4) add at playhead 5) properties editing
   6) verification. Ships the `keyboard` and `text` kinds only.
-- 🔨 **M6 Property Inspector — NEXT.** No plan agreed yet; present a numbered
-  step plan first.
+- 🔨 **M6 Property Inspector — NEXT.** A 6-step plan has been *presented* but
+  the user has **not said "go"** yet. See §5b. Do not start coding until they
+  approve it (and confirm the four open decisions).
 - ⬜ M7 Timeline Editing, M8 Rendering (ffmpeg MP4), M9 Project Files
   (guideforge.project JSON), M10 Polish.
 
@@ -98,6 +99,61 @@ Git state:
   `feature/<milestone>` branches. Remote: github.com/RafiShahriyar/wguide.
 - **Commit messages carry NO Claude co-author or "generated with" trailer** —
   the user asked for this explicitly.
+
+## 5a. Verified state of the build (last checked at end of M5)
+
+- `npm --prefix frontend run build` — clean.
+- `npm run build` (full gate) — clean: Go + Next export + Rust **release**
+  (~3m30s) + both bundles: `GuideForge_0.1.0_x64_en-US.msi` and
+  `GuideForge_0.1.0_x64-setup.exe` under `src-tauri/target/release/bundle/`.
+- Backend answers on 3939: `/health` → `{"status":"ok","app":"GuideForge
+  Backend","version":"0.1.0"}`, `/version` → `{"version":"0.1.0"}`.
+  ⚠️ That reply came from an **orphaned** backend left over from an earlier
+  session, not a freshly launched one — see the `backend:dev` bug in §10.
+- **The M5 manual checklist (10 items, `docs/Learning.md` → "Step 6") has NOT
+  been run by the user yet.** Ask before assuming M5 behaviour is confirmed.
+  Item 3 matters most: scrub to exactly `start + length` and check the overlay
+  disappears — types and builds cannot catch a `<=` there.
+
+## 5b. M6 plan — PROPOSED, awaiting the user's "go"
+
+M6 = give each overlay its own geometry. Today every overlay stacks
+bottom-centre at a fixed size. ("Duration" from the roadmap row already shipped
+in M5 as the Length field.)
+
+| # | Step | What lands |
+|---|------|------------|
+| 1 | Geometry in the model | `transform` on every clip: `x, y, scale, rotation, opacity` |
+| 2 | Render the transform | preview honours it instead of stacking bottom-centre |
+| 3 | Drag to position | grab an overlay on the video and move it |
+| 4 | Inspector controls | sliders + number fields for all five, plus reset |
+| 5 | Fade in / fade out | pure `clipOpacityAt(clip, time)` envelope |
+| 6 | Guard rails + verification | clamps, full gate, checklist, docs |
+
+Teaching angles agreed for each step: (1) *what units?* — the M4 "seconds not
+pixels" question again; (2) CSS `transform` order, and font size derived from
+the measured frame height rather than a fixed `text-sm`; (3) pixels→fractions,
+the mirror of `xToTime`, reusing pointer capture; (4) extract a reusable field
+component from `ClipInspector` (the "extract on second use" rule); (5)
+interpolation from first principles, pure because M8 calls it per frame;
+(6) also fixes the M5 leftover — `clip.start` is never clamped against the
+video's length.
+
+**Four open decisions** (recommendations given; user has not confirmed):
+
+1. **Coordinates normalized 0–1** — `x: 0.5, y: 0.85` = "halfway across, 85%
+   down". Resolution-independent, survives export at any size. Alternative
+   (native-resolution pixels) breaks on a different export size.
+2. **Scale relative to frame HEIGHT** — `scale: 1` = a sensible default size.
+   Height, not width, so overlays don't shrink oddly on ultrawide footage.
+3. **Anchor at the overlay's centre** — rotation around the centre feels
+   natural; top-left anchoring swings a rotated overlay away from the cursor.
+4. **Drag-on-video belongs in M6** — it is positioning, not timeline editing.
+   Dragging clips *along the timeline* stays in M7.
+
+**Explicitly NOT in M6:** keyframed animation (values changing over time — a
+much bigger model change), the mouse/arrow/image kinds, timeline
+drag/resize/snap (M7), persistence (M9).
 
 ## 6. HOW I WANT RESPONSES (read this carefully — it matters most)
 
@@ -139,6 +195,37 @@ Git state:
 - Known TS pitfall: null-narrowing is lost inside closures — capture
   `const el = ref.current!` in effects.
 
+Rules learned during M4/M5 — apply them, don't re-derive them:
+
+- **A discriminated union's union must be at the TOP level.** `interface X {
+  kind: K; props: A | B }` does NOT narrow — checking `kind` tells TypeScript
+  nothing about `props`. Write `type X = XA | XB` with a literal `kind` on each.
+  (M5 Step 3 had to rewrite `types.ts` for exactly this.)
+- **Invariants live in the reducer, not the form.** `updateClip` clamps
+  `start >= 0` and `duration >= MIN_CLIP_DURATION`, so M7's drag and M9's file
+  loader get them free. A rule that must always hold belongs where the data
+  changes.
+- **Raw keystrokes are UI state; the parsed value is data.** Only where the two
+  genuinely differ (the comma-separated Keys field → `string[]`). Its re-seed
+  effect depends on `clip.id` ONLY — depending on the parsed value overwrites
+  what the user is typing. `name`/`text` need no draft.
+- **When a reducer needs a fact another slice owns, pass it in the payload.**
+  Viewport actions carry `bounds: { duration, width }` because `duration` is in
+  the player slice and `width` is measured from the DOM. Visible in the type
+  signature, and the reducer stays pure.
+- **Pass down only what the store cannot know.** `TimelineToolbar` takes one
+  prop (`width`) and reads everything else from the store itself.
+- **Repeating `stopPropagation` means the layout is wrong.** The toolbar moved
+  outside the pointer-handling root instead of every button stopping
+  propagation.
+- **Culling is the norm:** `visibleTicks` and `isRectVisible` build DOM only for
+  what is on screen, so cost scales with the panel, not the video.
+- **Half-open intervals `[start, end)`** for anything time-ranged, so a clip
+  ending at 2.0 and one starting at 2.0 never both match.
+- Pure, React-free modules for anything M8's exporter must also compute:
+  `timelineCoords.ts`, `activeClips.ts`, `newClip.ts`. The editor and the
+  renderer must be able to run the same function and get the same answer.
+
 ## 8. Architecture patterns we rely on (keep them consistent)
 
 - **Element is the source of truth.** The native `<video>` owns playback; Redux
@@ -156,6 +243,38 @@ Git state:
   anchored zoom keeps the second under the cursor pinned.
 - Panels: layout slice stores `panels` sizes; `PanelDivider` (vertical +
   horizontal orientations) dispatches `resizePanel`; pointer capture + clamp.
+- **The timeline slice holds two concerns on purpose**: the VIEWPORT (`zoom`,
+  `viewportStart` — UI, never saved) and the DATA (`tracks`, `selectedClipId` —
+  absolute seconds, saved in M9). Only `tracks` goes in the project file.
+- **Clip position is always recomputed, never stored.** `clipRect(start,
+  duration, viewportStart, zoom)` runs every render; no code "moves" a clip.
+  Same for the playhead and the ruler — all three read the same two numbers,
+  which is why they stay in lockstep through any zoom or pan for free.
+- **Overlays anchor to the VIDEO box, not the panel.** `OverlayCanvas` measures
+  the `<video>` element's own `offsetLeft/Top/Width/Height` with TWO
+  ResizeObservers (the video resizes when metadata loads or the panel gets
+  taller, but it *slides* when the panel width changes and its own size does
+  not). Anchoring to the panel would float overlays over the letterbox bars and
+  disagree with M8's export.
+
+### Current M5 file map (`frontend/features/timeline/`)
+
+```
+types.ts             KeyboardClip | TextClip union, Track, ClipPatch, NewOverlayClip
+timelineSlice.ts     viewport + clip data; setZoom/panBy/zoomAt/fitToWindow/
+                     clampViewport + addClip/selectClip/updateClip/deleteClip
+timelineSelectors.ts selectTimeline/Zoom/ViewportStart/Tracks/SelectedClipId,
+                     selectSelectedClip (derived: id → the clip object)
+timelineCoords.ts    PURE: timeToX, xToTime, tickStep, visibleTicks, clipRect,
+                     isRectVisible, minZoomFor, maxViewportStart
+activeClips.ts       PURE: isClipActive, activeClipsAt  (half-open interval)
+newClip.ts           PURE: makeNewClip, DEFAULT_CLIP_DURATION, MIN_CLIP_DURATION
+components/Timeline.tsx        ruler + lanes + playhead; scrub, wheel zoom/pan
+components/TimelineToolbar.tsx + Keys / + Text / Fit  (outside the pointer root)
+components/ClipBlock.tsx       one clip as a lane block; click selects
+components/OverlayCanvas.tsx   live overlays drawn on the video preview
+components/ClipInspector.tsx   the Properties form (rendered by PropertiesPanel)
+```
 
 ## 9. Docs index (keep in sync)
 
