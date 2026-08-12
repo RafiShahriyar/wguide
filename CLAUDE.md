@@ -46,7 +46,15 @@ src-tauri/       Rust/Tauri shell (src/, tauri.conf.json, binaries/ [gitignored]
 scripts/         build-backend.ps1, run-tauri.ps1 (resolve toolchains by absolute path)
 docs/            design + learning docs (see §9)
 assets/          icon source images
+.claude/         launch.json — dev-server config for the preview/browser tooling
 ```
+
+⚠️ On the current machine the project sits at
+`Downloads/wguide-main/wguide-main/` — a **nested** folder, because it started as
+a GitHub "Download ZIP" rather than a clone. It was turned back into a real repo
+in place (`git init`, remote added, `git reset --hard origin/main`) after checking
+the tree was byte-identical to `58748e5`, so nothing was lost. The outer
+`wguide-main/` is not part of the repo. Work from the inner directory.
 
 Feature folders live under `frontend/features/<feature>/` with
 `<feature>Slice.ts`, `<feature>Selectors.ts`, `components/`, `hooks/`.
@@ -62,7 +70,15 @@ npm run backend:dev    # Go backend only
 ```
 
 - Verify with `npm --prefix frontend run build` after each step (catches TS).
-- Full gate: `npm run build` at the end of a milestone.
+- Full gate: `npm run build` at the end of a milestone — **blocked on the current
+  machine, see §10.** M6 was developed entirely through `npm run frontend:dev` in
+  a browser at `localhost:3000`, which needs neither Rust nor the Go sidecar. The
+  frontend has **no Tauri dependency at all** (no `@tauri-apps/api` in
+  `frontend/package.json`, zero Tauri calls in the source), and the video is
+  loaded through an ordinary `<input type="file">` + `URL.createObjectURL`, so
+  everything up to M8 can be built this way.
+- Only the frontend install is needed for that: `npm install --prefix frontend`.
+  The root `npm install` exists to fetch the Tauri CLI.
 - NEVER assume a library is available; check first. We have react, react-dom,
   next, redux toolkit, react-redux, typescript, tailwindcss (zinc/emerald
   palette), tauri + tauri-plugin-shell, go stdlib, serde/tauri crates.
@@ -82,77 +98,104 @@ Milestones (see `docs/Roadmap.md`, table):
 - ✅ **M5 Overlay Engine** — all 6 steps done: 1) clip/track model
   2) lane blocks 3) preview overlay 4) add at playhead 5) properties editing
   6) verification. Ships the `keyboard` and `text` kinds only.
-- 🔨 **M6 Property Inspector — NEXT.** A 6-step plan has been *presented* but
-  the user has **not said "go"** yet. See §5b. Do not start coding until they
-  approve it (and confirm the four open decisions).
-- ⬜ M7 Timeline Editing, M8 Rendering (ffmpeg MP4), M9 Project Files
-  (guideforge.project JSON), M10 Polish.
+- ✅ **M6 Property Inspector** — all 6 steps done: 1) `transform` on every clip
+  2) renderer honours it 3) drag on the video 4) five slider+number rows + Reset
+  5) fade in/out envelope 6) guard rails. **Frontend-verified only**: the full
+  `npm run build` gate could not run on this machine (see §10) and the 16-item
+  checklist in `docs/Learning.md` → "Step 6" has **NOT been run**. Do not record
+  M6 as green until both are done.
+- 🔨 **M7 Timeline Editing — NEXT.** No plan presented yet; present a numbered
+  step plan and wait for "go".
+- ⬜ M8 Rendering (ffmpeg MP4), M9 Project Files (guideforge.project JSON),
+  M10 Polish.
 
 M5 deferred on purpose: mouse/arrow/image kinds; move/resize/snap and
 multi-select (M7); per-overlay position/size (M6); persistence (M9) — clips
 vanish on restart.
 
 Git state:
-- `main` = M1+M2. `dev` = M4+M4.5+M5 (squash-merged), pushed.
+- `main` = M1→M5. `dev` was merged into `main` via PR #4 (commit `fe0cae1`), so
+  main is current through M5. M6 currently exists only as uncommitted
+  working-tree changes on top of it.
 - `feature/m4-m5-timeline-overlays` holds the same work as one commit.
 - Strategy: `main` stable, `dev` integration (squash-merge features),
   `feature/<milestone>` branches. Remote: github.com/RafiShahriyar/wguide.
 - **Commit messages carry NO Claude co-author or "generated with" trailer** —
   the user asked for this explicitly.
 
-## 5a. Verified state of the build (last checked at end of M5)
+## 5a. Verified state of the build
 
-- `npm --prefix frontend run build` — clean.
-- `npm run build` (full gate) — clean: Go + Next export + Rust **release**
-  (~3m30s) + both bundles: `GuideForge_0.1.0_x64_en-US.msi` and
-  `GuideForge_0.1.0_x64-setup.exe` under `src-tauri/target/release/bundle/`.
-- Backend answers on 3939: `/health` → `{"status":"ok","app":"GuideForge
-  Backend","version":"0.1.0"}`, `/version` → `{"version":"0.1.0"}`.
-  ⚠️ That reply came from an **orphaned** backend left over from an earlier
-  session, not a freshly launched one — see the `backend:dev` bug in §10.
-- **The M5 manual checklist (10 items, `docs/Learning.md` → "Step 6") has NOT
-  been run by the user yet.** Ask before assuming M5 behaviour is confirmed.
-  Item 3 matters most: scrub to exactly `start + length` and check the overlay
-  disappears — types and builds cannot catch a `<=` there.
+**Current machine (M6 was built here):**
 
-## 5b. M6 plan — PROPOSED, awaiting the user's "go"
+- `npm --prefix frontend run build` — clean after every M6 step. This is the only
+  automated gate available here.
+- `npm run build` (full gate) — **cannot run at all**; see the nested-PowerShell
+  block in §10. Not a code problem.
+- Go sidecar never launched here (nothing answers on 3939), so the StatusBar shows
+  the backend offline and the browser console logs
+  `GET 127.0.0.1:3939/health` refusals. **That is the expected shape of
+  frontend-only development — not a bug to chase.**
 
-M6 = give each overlay its own geometry. Today every overlay stacks
-bottom-centre at a fixed size. ("Duration" from the roadmap row already shipped
-in M5 as the Length field.)
+**Previous machine (end of M5, for reference):** the full `npm run build` gate was
+clean there — Go + Next export + Rust release (~3m30s) + both
+`GuideForge_0.1.0_x64_en-US.msi` and `GuideForge_0.1.0_x64-setup.exe` under
+`src-tauri/target/release/bundle/`. Backend answered on 3939. ⚠️ That reply came
+from an **orphaned** backend, not a freshly launched one — see §10.
 
-| # | Step | What lands |
-|---|------|------------|
-| 1 | Geometry in the model | `transform` on every clip: `x, y, scale, rotation, opacity` |
-| 2 | Render the transform | preview honours it instead of stacking bottom-centre |
-| 3 | Drag to position | grab an overlay on the video and move it |
-| 4 | Inspector controls | sliders + number fields for all five, plus reset |
-| 5 | Fade in / fade out | pure `clipOpacityAt(clip, time)` envelope |
-| 6 | Guard rails + verification | clamps, full gate, checklist, docs |
+**Two manual checklists are outstanding. Ask before assuming either milestone's
+behaviour is confirmed:**
 
-Teaching angles agreed for each step: (1) *what units?* — the M4 "seconds not
-pixels" question again; (2) CSS `transform` order, and font size derived from
-the measured frame height rather than a fixed `text-sm`; (3) pixels→fractions,
-the mirror of `xToTime`, reusing pointer capture; (4) extract a reusable field
-component from `ClipInspector` (the "extract on second use" rule); (5)
-interpolation from first principles, pure because M8 calls it per frame;
-(6) also fixes the M5 leftover — `clip.start` is never clamped against the
-video's length.
+- **M5, 10 items** — `docs/Learning.md` → "Step 6 — M5 verification pass". Item 3
+  matters most: scrub to exactly `start + length` and check the overlay
+  disappears. Types and builds cannot catch a `<=` there.
+- **M6, 16 items** — `docs/Learning.md` → "The M6 manual checklist". The five that
+  nothing automated can see: #5 drag past the left edge, #10 press Reset *twice*
+  (the frozen-constant trap), #12 fade ramps rather than pops, #14 shrink Length
+  below the fade, #15 Start beyond the end of the video.
 
-**Four open decisions** (recommendations given; user has not confirmed):
+### How to verify on this machine
+
+Because `npm run dev` is blocked, M6 was verified three ways, and the same three
+work for M7:
+
+1. `npm --prefix frontend run build` after every step — TypeScript + static export.
+2. **The in-app browser against `npm run frontend:dev`.** `.claude/launch.json`
+   defines a `frontend` server on port 3000 for the preview tooling; if port 3000
+   is already busy that is usually the user's own `next dev`, so attach to it
+   rather than starting a second one. Measuring beats squinting — the Panel
+   overflow bug in §8 was found with four `getBoundingClientRect()` numbers after
+   the reported cause (video duration) turned out to be a red herring.
+3. **Numeric checks of the pure modules** via `node -e`, re-implementing the
+   expression under test. This is how the fade envelope and the rotation wrap were
+   confirmed, including the overlapping-fade case.
+
+**Known limit:** a file `<input>` cannot be driven from outside the browser, so
+anything needing a loaded video — the drag, the inspector, the fades — is
+**unverifiable by the agent** and must go on the user's checklist. Say so plainly
+rather than implying it was tested.
+
+## 5b. M6 — what shipped
+
+M6 gave each overlay its own geometry. The four design decisions were taken as
+recommended and are now baked into the code:
 
 1. **Coordinates normalized 0–1** — `x: 0.5, y: 0.85` = "halfway across, 85%
-   down". Resolution-independent, survives export at any size. Alternative
-   (native-resolution pixels) breaks on a different export size.
-2. **Scale relative to frame HEIGHT** — `scale: 1` = a sensible default size.
-   Height, not width, so overlays don't shrink oddly on ultrawide footage.
-3. **Anchor at the overlay's centre** — rotation around the centre feels
-   natural; top-left anchoring swings a rotated overlay away from the cursor.
-4. **Drag-on-video belongs in M6** — it is positioning, not timeline editing.
-   Dragging clips *along the timeline* stays in M7.
+   down". Resolution-independent, so the editor and M8's export agree at any size.
+2. **Scale relative to frame HEIGHT** — via `frameScale = frame.height /
+   REFERENCE_FRAME_HEIGHT` (450), so at a 450px-tall preview overlays look exactly
+   as they did in M5.
+3. **Anchor at the overlay's centre** — `translate(-50%, -50%) rotate() scale()`,
+   in that order. Order is load-bearing; see Learning.md → Step 2.
+4. **Drag-on-video is M6**; dragging clips *along the timeline* is M7.
 
-**Explicitly NOT in M6:** keyframed animation (values changing over time — a
-much bigger model change), the mouse/arrow/image kinds, timeline
+New/changed model: `ClipTransform { x, y, scale, rotation, opacity }` on
+`ClipBase`, plus `fadeIn` / `fadeOut` seconds beside `start` / `duration`
+(timing, not geometry). `ClipPatch` gained `transform?`, `fadeIn?`, `fadeOut?`.
+`updateClip`'s payload gained an optional `videoDuration` so the reducer can hold
+clips inside the footage.
+
+**Explicitly NOT in M6, still open:** keyframed animation (values changing over
+time — a much bigger model change), the mouse/arrow/image kinds, timeline
 drag/resize/snap (M7), persistence (M9).
 
 ## 6. HOW I WANT RESPONSES (read this carefully — it matters most)
@@ -223,8 +266,50 @@ Rules learned during M4/M5 — apply them, don't re-derive them:
 - **Half-open intervals `[start, end)`** for anything time-ranged, so a clip
   ending at 2.0 and one starting at 2.0 never both match.
 - Pure, React-free modules for anything M8's exporter must also compute:
-  `timelineCoords.ts`, `activeClips.ts`, `newClip.ts`. The editor and the
-  renderer must be able to run the same function and get the same answer.
+  `timelineCoords.ts`, `activeClips.ts`, `newClip.ts`, `overlayCoords.ts`,
+  `clipOpacity.ts`. The editor and the renderer must be able to run the same
+  function and get the same answer.
+
+Rules learned during M6 — apply them, don't re-derive them:
+
+- **A type system verifies the shape of what you pass, never that anyone read
+  it.** Step 1 added `transform?` to `ClipPatch` and Step 2 rendered
+  `clip.transform`, but `updateClip` had no branch for `patch.transform` — so the
+  first drag dispatched a perfectly valid action that changed nothing. Both sides
+  typechecked. When you add a patch field, add its reducer branch in the same
+  breath.
+- **A percentage needs something definite to be a percentage OF.** `h-full`,
+  `max-h-full`, `flex-1`, `min-h-0` are one family; a single `auto` high up
+  silently disables all of them below it. `min-h-0` without a height is half a
+  fix. See the `Panel.tsx` note in §8.
+- **Round where imprecision ENTERS, never where it is displayed.** Rounding a
+  controlled input's `value` swallows keystrokes — the KeysField bug in a new
+  costume. `roundPosition` runs in the reducer, the one choke point.
+- **Build guarded objects field-by-field, not with a spread.** The transform
+  block lists all five fields, so a sixth field on `ClipTransform` stops the
+  literal compiling until it is given a rule. A spread would let it through
+  unguarded.
+- **Refuse NaN at the door** (`finiteOr`). NaN in geometry renders as
+  `scale(NaN)`: the overlay vanishes and *nothing* reports an error.
+- **Choose the operator so the degenerate case handles itself.** `Math.min` in
+  the fade envelope means overlapping fade-in/fade-out simply peaks lower —
+  no value above 1, no flicker, no validation error, no special case.
+- **Some invariants span two fields.** Shrinking `duration` must also shrink
+  `fadeIn`/`fadeOut`: no single field was invalid, the *combination* was. Another
+  reason invariants belong where the data changes.
+- **Lift `pointer-events` selectively.** The overlay container stays
+  `pointer-events-none` and each item opts back in with `pointer-events-auto`.
+  Removing it from the container makes the whole video frame a click-blocker.
+- **Copy shared mutable defaults** (`{ ...DEFAULT_TRANSFORM }`). Handing the
+  constant itself into the store lets Redux Toolkit freeze it, and every later
+  Reset would be resetting a frozen object.
+- **CSS transform order is load-bearing.** `translate(-50%,-50%) rotate() scale()`
+  — in that order, because `transform-origin` defaults to the element's centre and
+  `translate`'s percentages resolve against its *untransformed* size. Reversed, the
+  scale multiplies the -50% shift and every overlay sits half its width off-target.
+- **Reproduce by measuring, not by squinting.** The reported cause of the panel
+  overflow (long video) and the real cause (a missing class three components away)
+  had nothing to do with each other.
 
 ## 8. Architecture patterns we rely on (keep them consistent)
 
@@ -257,24 +342,40 @@ Rules learned during M4/M5 — apply them, don't re-derive them:
   not). Anchoring to the panel would float overlays over the letterbox bars and
   disagree with M8's export.
 
-### Current M5 file map (`frontend/features/timeline/`)
+### Current M6 file map (`frontend/features/timeline/`)
 
 ```
-types.ts             KeyboardClip | TextClip union, Track, ClipPatch, NewOverlayClip
+types.ts             KeyboardClip | TextClip union, Track, ClipPatch,
+                     NewOverlayClip, ClipTransform; fadeIn/fadeOut on ClipBase
 timelineSlice.ts     viewport + clip data; setZoom/panBy/zoomAt/fitToWindow/
-                     clampViewport + addClip/selectClip/updateClip/deleteClip
+                     clampViewport + addClip/selectClip/updateClip/deleteClip.
+                     updateClip owns ALL invariants: start/duration vs
+                     videoDuration, fade ≤ duration, x/y 0–1 + rounded,
+                     scale/opacity clamped, rotation folded to one turn
 timelineSelectors.ts selectTimeline/Zoom/ViewportStart/Tracks/SelectedClipId,
                      selectSelectedClip (derived: id → the clip object)
 timelineCoords.ts    PURE: timeToX, xToTime, tickStep, visibleTicks, clipRect,
                      isRectVisible, minZoomFor, maxViewportStart
+overlayCoords.ts     PURE: draggedPosition (pixels → 0–1, mirror of xToTime),
+                     roundPosition
 activeClips.ts       PURE: isClipActive, activeClipsAt  (half-open interval)
-newClip.ts           PURE: makeNewClip, DEFAULT_CLIP_DURATION, MIN_CLIP_DURATION
+clipOpacity.ts       PURE: clipOpacityAt — fade envelope × base opacity
+newClip.ts           PURE: makeNewClip, DEFAULT_CLIP_DURATION, MIN_CLIP_DURATION,
+                     DEFAULT_TRANSFORM, MIN_SCALE, MAX_SCALE
 components/Timeline.tsx        ruler + lanes + playhead; scrub, wheel zoom/pan
 components/TimelineToolbar.tsx + Keys / + Text / Fit  (outside the pointer root)
 components/ClipBlock.tsx       one clip as a lane block; click selects
-components/OverlayCanvas.tsx   live overlays drawn on the video preview
-components/ClipInspector.tsx   the Properties form (rendered by PropertiesPanel)
+components/OverlayCanvas.tsx   live overlays on the preview; measures the video
+                               box; per-clip transform; drag with pointer capture
+components/ClipInspector.tsx   Properties form: name/start/length/fades/props
+components/TransformFields.tsx X/Y/Scale/Rotation/Opacity sliders + Reset
+components/Field.tsx           shared labelled row + INPUT class string
 ```
+
+Panel layout note (found during M6): `components/layout/Panel.tsx` needs
+`h-full` — without it the section is content-height, every percentage height
+inside it silently resolves to `auto`, and the video's height ends up driven by
+the panel's WIDTH, overflowing into the timeline row.
 
 ## 9. Docs index (keep in sync)
 
@@ -300,6 +401,22 @@ components/ClipInspector.tsx   the Properties form (rendered by PropertiesPanel)
   only the run path is stale. Fix the script in package.json, or run the built
   exe directly. `npm run dev` is unaffected — Tauri spawns the sidecar itself.
 - Tauri build downloads WiX/NSIS on first bundle.
+- **`npm run dev` / `npm run build` cannot run on the current machine.** A nested
+  PowerShell — one that is itself a child process — is denied permission to launch
+  *any* executable here. Verified: `where.exe`, `hostname.exe`, `node.exe`,
+  `go.exe` and `rustc.exe` all fail with "Access is denied" from a nested
+  `powershell` **or** `pwsh`, while `cmd.exe` launching the identical binary
+  succeeds, as does a top-level shell. Both npm scripts route through
+  `powershell -File scripts/…`, so both sit exactly on the blocked hop. Likely a
+  corporate endpoint policy (this is a domain machine: ACLs show `USB\<user>`);
+  `Get-MpPreference` would not load its module and the AppLocker query hung, so
+  the rule could not be positively identified without admin.
+  Workarounds: `npm run frontend:dev` and `npm --prefix frontend run build` are
+  unaffected (no PowerShell in the chain), and `cmd /c "<exe> …"` works.
+- **MSVC build tools are NOT installed** on the current machine (no `link.exe`,
+  no `cl.exe`, no `vswhere.exe`, no Windows SDK). Rust 1.97.1 + rustup 1.29.0 and
+  Go 1.26.5 are present, and Node is v24.11.1. So Rust can compile but cannot
+  link — needed before M8. WebView2 runtime 151.0.4129.72 is present.
 
 ## 11. Reminders / known deferred items
 
@@ -310,6 +427,8 @@ components/ClipInspector.tsx   the Properties form (rendered by PropertiesPanel)
   ~4×/s, so a preview overlay can appear/vanish up to ~250ms late **during
   playback**. Scrubbing is exact and the M8 export evaluates per frame, so this
   is cosmetic. Fix = a requestAnimationFrame mirror.
-- Nothing clamps `clip.start` against the video's length — an overlay can be
-  retimed past the end of the video. Harmless today; M6/M7 should fix it.
+- ~~Nothing clamps `clip.start` against the video's length.~~ **Fixed in M6
+  Step 6**: `updateClip` clamps `start` to `videoDuration - MIN_CLIP_DURATION`
+  when the caller passes `videoDuration`. M7's drag and M9's loader must pass it
+  too — it is optional in the payload type.
 - `frontend/AGENTS.md` is auto-recreated by `next dev`; committing it is fine.

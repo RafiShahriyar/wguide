@@ -9,7 +9,13 @@ import {
   minZoomFor,
   type ViewportBounds,
 } from "./timelineCoords";
-import { MIN_CLIP_DURATION } from "./newClip";
+import {
+  DEFAULT_TRANSFORM,
+  MAX_SCALE,
+  MIN_CLIP_DURATION,
+  MIN_SCALE,
+} from "./newClip";
+import { roundPosition } from "./overlayCoords";
 import type {
   ClipPatch,
   NewOverlayClip,
@@ -38,6 +44,24 @@ function clampStart(
 ): number {
   const safe = Number.isFinite(start) ? start : 0;
   return clamp(safe, 0, maxViewportStart(bounds, zoom));
+}
+
+// A NaN reaching geometry is uniquely nasty: it renders as `scale(NaN)`, the
+// overlay silently vanishes, and nothing anywhere reports an error. Numbers are
+// refused at the door instead. `Infinity` is caught by the same check.
+function finiteOr(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback;
+}
+
+// Fold any angle into a single turn, so 370° and 730° both become 10° and −270°
+// becomes 90°. Without this, spinning a slider or loading an odd project file
+// could store 3600° — visually identical to 0° but nonsense to read in the
+// inspector, and something M8 would have to re-derive.
+//
+// The `((n % 360) + 360) % 360` dance is the standard fix for JavaScript's `%`,
+// which keeps the sign of the left operand: `-90 % 360` is `-90`, not `270`.
+function normalizeRotation(degrees: number): number {
+  return ((((degrees + 180) % 360) + 360) % 360) - 180;
 }
 
 export interface TimelineState {
@@ -148,21 +172,63 @@ const timelineSlice = createSlice({
     },
 updateClip(
       state,
-      action: PayloadAction<{ id: string; patch: ClipPatch }>,
+      action: PayloadAction<{
+        id: string;
+        patch: ClipPatch;
+        // The video's length, which lives in the PLAYER slice. Callers that touch
+        // `start` or `duration` pass it so those can be held inside the footage;
+        // transform-only callers (the drag, the geometry sliders) omit it
+        // legitimately, because they cannot violate that rule.
+        videoDuration?: number;
+      }>,
     ) {
       const clip = findClip(state, action.payload.id);
       if (!clip) return;
-      const { patch } = action.payload;
+      const { patch, videoDuration } = action.payload;
+
+      // Only trust a real, positive length. Before metadata loads `duration` is
+      // 0, and clamping against 0 would collapse every clip to the very start.
+      const videoEnd =
+        videoDuration !== undefined &&
+        Number.isFinite(videoDuration) &&
+        videoDuration > 0
+          ? videoDuration
+          : null;
+
       if (patch.name !== undefined) clip.name = patch.name;
-      // The invariants ("never before 0:00", "never shorter than we can draw")
-      // live HERE rather than in the properties form. Any future caller — a
-      // drag in M7, a pasted project file in M9 — gets them for free, and the
-      // form is left to worry only about what the user typed.
+      // The invariants ("never before 0:00", "never shorter than we can draw",
+      // "never past the end of the footage") live HERE rather than in the
+      // properties form. Any future caller — a drag in M7, a pasted project file
+      // in M9 — gets them for free, and the form is left to worry only about
+      // what the user typed.
       if (patch.start !== undefined) {
-        clip.start = Math.max(0, patch.start);
+        // Leave at least MIN_CLIP_DURATION of video after the start, so a clip
+        // can never be parked somewhere it could not possibly be seen.
+        const latestStart =
+          videoEnd === null ? Infinity : Math.max(0, videoEnd - MIN_CLIP_DURATION);
+        clip.start = clamp(finiteOr(patch.start, clip.start), 0, latestStart);
       }
       if (patch.duration !== undefined) {
-        clip.duration = Math.max(MIN_CLIP_DURATION, patch.duration);
+        const longest =
+          videoEnd === null
+            ? Infinity
+            : Math.max(MIN_CLIP_DURATION, videoEnd - clip.start);
+        clip.duration = clamp(
+          finiteOr(patch.duration, clip.duration),
+          MIN_CLIP_DURATION,
+          longest,
+        );
+        // An invariant that spans two fields: shortening a clip must not leave a
+        // fade longer than the clip it belongs to. Doing this here means the
+        // Length box cannot produce a nonsensical pair, however it is edited.
+        clip.fadeIn = Math.min(clip.fadeIn, clip.duration);
+        clip.fadeOut = Math.min(clip.fadeOut, clip.duration);
+      }
+      if (patch.fadeIn !== undefined) {
+        clip.fadeIn = clamp(finiteOr(patch.fadeIn, 0), 0, clip.duration);
+      }
+      if (patch.fadeOut !== undefined) {
+        clip.fadeOut = clamp(finiteOr(patch.fadeOut, 0), 0, clip.duration);
       }
       // `props` can't just be assigned: `clip` is now a union, so TypeScript
       // wants proof that the incoming props match THIS clip's kind. The `in`
@@ -175,6 +241,33 @@ updateClip(
         } else if (clip.kind === "text" && "text" in patch.props) {
           clip.props = patch.props;
         }
+      }
+      // Geometry. Every field is clamped HERE rather than in the drag handler or
+      // the sliders, for the same reason `start` and `duration` are: "an overlay
+      // never leaves the frame" is a rule about the DATA, so it belongs where the
+      // data changes. The drag, the inspector's fields and M9's project loader
+      // all get it without asking.
+      //
+      // Note this builds the object field by field instead of spreading
+      // `patch.transform`. That is deliberate: if ClipTransform ever gains a
+      // sixth field, this object literal stops compiling until the new field is
+      // given a rule here — the compiler enforces that no geometry goes
+      // unguarded.
+      if (patch.transform !== undefined) {
+        const next = patch.transform;
+        clip.transform = {
+          x: roundPosition(clamp(finiteOr(next.x, DEFAULT_TRANSFORM.x), 0, 1)),
+          y: roundPosition(clamp(finiteOr(next.y, DEFAULT_TRANSFORM.y), 0, 1)),
+          scale: clamp(
+            finiteOr(next.scale, DEFAULT_TRANSFORM.scale),
+            MIN_SCALE,
+            MAX_SCALE,
+          ),
+          rotation: normalizeRotation(
+            finiteOr(next.rotation, DEFAULT_TRANSFORM.rotation),
+          ),
+          opacity: clamp(finiteOr(next.opacity, DEFAULT_TRANSFORM.opacity), 0, 1),
+        };
       }
     },
     deleteClip(state, action: PayloadAction<string>) {
