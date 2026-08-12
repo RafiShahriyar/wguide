@@ -1212,6 +1212,856 @@ step of M5, and it would have passed just as happily if the half-open interval
 had been `<=` and every overlay flickered at its boundary. Types check
 *structure*; only the checklist checks *meaning*.
 
+## Milestone 6 — Property Inspector
+
+Every overlay in M5 stacked bottom-centre at a fixed size. M6 gives each one its
+own geometry: position, size, rotation, opacity, and a fade envelope.
+
+### Step 1 — Geometry in the model
+
+**Files touched:** `frontend/features/timeline/types.ts`,
+`frontend/features/timeline/newClip.ts`
+
+**New concepts:** normalized (resolution-independent) coordinates; why geometry
+belongs on the base type rather than in `props`; using a *required* field as a
+compiler-enforced migration; the shared-mutable-default trap.
+
+Nothing on screen changes in this step. That is the point — the model has to
+carry the numbers before Step 2 can read them.
+
+#### The units question, again
+
+M4 asked "seconds or pixels?" and answered *seconds*. M6 asks the same question
+in a new costume, and answers *fractions*:
+
+```ts
+export interface ClipTransform {
+  x: number;        // 0–1 across the frame  (0.5 = halfway)
+  y: number;        // 0–1 down the frame    (0.85 = near the bottom)
+  scale: number;    // 1 = default size, measured against frame HEIGHT
+  rotation: number; // degrees, clockwise, about the overlay's CENTRE
+  opacity: number;  // 0 = invisible, 1 = solid
+}
+```
+
+#### Worked example — one clip, two frame sizes
+
+A text overlay with `transform: { x: 0.5, y: 0.85, … }`. The editor preview is
+**800×450**; M8 will export the same project at **1920×1080**.
+
+| | frame | centre lands at | reads as |
+|---|---|---|---|
+| Preview | 800 × 450 | `0.5 × 800 = 400`, `0.85 × 450 = 382.5` | halfway across, near the bottom |
+| Export | 1920 × 1080 | `0.5 × 1920 = 960`, `0.85 × 1080 = 918` | halfway across, near the bottom |
+
+Two very different pixel answers, one identical *meaning*. That is the whole
+argument for fractions.
+
+Now suppose we had stored native pixels instead, and the user positioned the
+overlay on the preview at `(400, 382)`. Export at 1920×1080 replays those same
+numbers, and `400/1920 = 21%` across, `382/1080 = 35%` down — the caption you
+carefully centred near the bottom comes out in the upper-left quadrant. The
+export would silently disagree with the editor, which is exactly the failure the
+`OverlayCanvas` frame-measuring in M5 Step 3 was built to avoid.
+
+The same reasoning picks **height** for `scale`: 1080 ÷ 450 = 2.4, so a
+`scale: 1` overlay is 2.4× more pixels tall in the export than in the preview
+and occupies the identical share of the picture. Had we scaled off the width, a
+21:9 ultrawide recording would shrink every overlay relative to a 16:9 one.
+
+#### Why `transform` sits on `ClipBase`, not in `props`
+
+```ts
+interface ClipBase {
+  id: string;
+  name: string;
+  start: number;
+  duration: number;
+  transform: ClipTransform;   // ← here
+}
+```
+
+`props` is what makes each kind *different* — keycaps have `keys`, text has
+`text` and `color`. Geometry is what every kind has in *common*. Putting it on
+the base means the mouse, arrow and image kinds inherit positioning for free
+when they arrive, and — more importantly — Step 2's renderer can read
+`clip.transform` without first narrowing on `clip.kind`.
+
+#### Required, not optional — letting the compiler do the migration
+
+`transform: ClipTransform` is **required**. Every existing way of building a clip
+therefore stops compiling until it supplies one, and the compiler hands you the
+list of places to fix. There was exactly one: the two `return` statements in
+`makeNewClip`. (`addClip` spreads a `NewOverlayClip` it is handed, so it needed
+no change at all.)
+
+Writing `transform?: ClipTransform` instead would have compiled immediately and
+felt easier — and then every reader for the rest of the project's life would
+have to cope with `undefined`: `clip.transform?.x ?? 0.5` in the renderer, in the
+inspector, in the drag handler, in M8's exporter. A one-time fix in one file
+beats a permanent tax in five.
+
+#### Pitfall — the shared mutable default
+
+```ts
+transform: { ...DEFAULT_TRANSFORM },   // a COPY, not the constant itself
+```
+
+Writing `transform: DEFAULT_TRANSFORM` would hand *every* clip a reference to
+the same object. Two consequences, both nasty:
+
+- Any code that mutates one clip's transform outside a reducer moves **every**
+  overlay at once, because they are all literally the same object.
+- Redux Toolkit freezes the state it produces. That constant would become part
+  of the store, so it would get frozen — and the exported `DEFAULT_TRANSFORM`
+  would silently become immutable everywhere else in the app, including in the
+  Reset button planned for Step 4.
+
+Spreading five fields costs nothing. The bug it prevents is the kind you lose an
+afternoon to.
+
+#### Pitfall — one patch convention, not two
+
+`ClipPatch` takes a whole `ClipTransform`, matching how `props` already works:
+callers spread what they want to keep, `{ ...clip.transform, x: 0.3 }`.
+`Partial<ClipTransform>` was the alternative and would let Step 3's drag send
+only `x` and `y` — but then `ClipPatch` would contain two different patch
+conventions side by side. Consistency with the existing rule won.
+
+**Verified:** `npm --prefix frontend run build` clean — compiled in 6.9s,
+TypeScript in 2.1s, all 4 static pages generated. The full `npm run build` gate
+could not run on this machine (see the toolchain note below).
+
+**Environment note:** this milestone is being built with `npm run frontend:dev`
+only. The machine cannot run `npm run build`, because npm invokes it through
+`powershell -File scripts/…`, and a nested PowerShell here is denied permission
+to launch *any* executable — `where.exe` and `hostname.exe` fail the same way,
+while `cmd.exe` launching the identical binary succeeds. MSVC build tools are
+also not installed, so Rust could compile but not link. Neither blocks M6, which
+is frontend-only; both must be resolved before M8.
+
+### Step 2 — Render the transform
+
+**Files touched:** `frontend/features/timeline/components/OverlayCanvas.tsx`
+
+**New concepts:** CSS transform *order* and `transform-origin`; percentage
+positioning inside a measured box; scaling a whole rendered box vs scaling only
+its font; why an element with no width needs `whitespace-nowrap`.
+
+The flex column that stacked every overlay bottom-centre is gone:
+
+```diff
+- <div className="pointer-events-none absolute flex flex-col items-center
+-                 justify-end gap-2 pb-[6%]" style={frame}>
++ <div className="pointer-events-none absolute" style={frame}>
+```
+
+Each item now places itself:
+
+```ts
+const style: CSSProperties = {
+  left: `${x * 100}%`,
+  top: `${y * 100}%`,
+  transform: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scale * frameScale})`,
+  opacity,
+};
+```
+
+#### Why percentages and not pixels
+
+The container is *exactly* the measured video frame — that is what `style={frame}`
+does. So `left: 50%` already means "half way across the video", and it stays
+correct when the frame changes size without recomputing anything. The only place
+that still needs the frame in real pixels is `frameScale`, because "how big
+should this text be" has no percentage equivalent.
+
+#### Worked example — one label, two frame sizes
+
+A text clip with `transform: { x: 0.5, y: 0.85, scale: 1, rotation: 0,
+opacity: 1 }`. Say the rendered label measures **96 × 30** px.
+
+**Frame 800 × 450** (the reference height, so `frameScale = 450/450 = 1`):
+
+1. `left: 50%`, `top: 85%` put the label's **top-left corner** at
+   `(0.5 × 800, 0.85 × 450)` = `(400, 382.5)` inside the frame.
+2. `translate(-50%, -50%)` shifts it by half its own size — `(−48, −15)`.
+3. Its **centre** now sits at `(400, 382.5)`. Exactly the point the data named.
+
+**Frame 1200 × 675** (`frameScale = 675/450 = 1.5`):
+
+1. `left: 50%` → `600`; `top: 85%` → `573.75`.
+2. `scale(1.5)` draws the label at **144 × 45** — font, padding and borders all
+   1.5× — but scaling happens about its centre, so the centre does not move.
+3. Centre still lands on `(600, 573.75)` = halfway across, 85% down. Same
+   meaning, bigger picture.
+
+#### Pitfall — transform order is not cosmetic
+
+A CSS transform list applies **right-to-left**, and `transform-origin` defaults
+to the element's own centre. That default is what makes this order work: `scale`
+and `rotate` both operate about the centre, so neither moves it, and
+`translate(-50%, -50%)` is left to do the positioning.
+
+Write it the other way round and it breaks:
+
+| order | what happens to the centre |
+|---|---|
+| `translate(-50%,-50%) rotate(R) scale(S)` | lands on `(x, y)` — correct |
+| `scale(S) rotate(R) translate(-50%,-50%)` | the translate happens first, so the scale multiplies it too |
+
+Concretely: a 100px-wide overlay at `scale: 2`. Correct order shifts it back
+50px. Reversed, the scale multiplies that shift to **100px** — every overlay sits
+half its own width off-target, and the error grows as you scale up. The
+percentages in `translate` resolve against the element's *untransformed* size,
+which is precisely why the shift must be applied last.
+
+#### Pitfall — scaling the font is not scaling the overlay
+
+The obvious reading of "derive font size from the frame" is
+`fontSize: frame.height * something`. But the keycap's look is Tailwind's
+`px-2.5 py-1 border-b-4` — **fixed pixels**. Triple the font and you get large
+text crammed into the same small padding with the same hairline 4px bottom
+border. It looks wrong immediately.
+
+A CSS `scale` transform scales the entire rendered box — glyphs, padding, border
+widths, corner radii — in one uniform step. One number, nothing left behind.
+
+The trade-off worth knowing: the box is laid out at its 1× size and then scaled,
+rather than laid out at the final size. Browsers re-rasterize text for a scaled
+layer so it stays sharp, and M8's exporter never touches CSS at all — it
+recomputes from the same `x, y, scale, rotation` numbers. So the trade-off costs
+nothing in either place that matters.
+
+#### Pitfall — an element with no width will wrap
+
+The item is absolutely positioned with no width set, so it shrinks to fit its
+content. Put a long caption near the right-hand edge of the frame and the text
+wraps into a two-line block — which makes the element **taller**, which moves its
+centre, so the overlay no longer sits where the maths says it does.
+`whitespace-nowrap` keeps it one line and keeps the geometry honest.
+
+#### Expected consequences of this step
+
+Both are correct, and both get addressed later:
+
+- **Overlays at the same moment now overlap** instead of stacking politely in a
+  column. Every clip starts at `DEFAULT_TRANSFORM`, so they land on top of each
+  other. Step 3's drag is what pulls them apart — the old flex column was hiding
+  the fact that there was no real positioning at all.
+- **An overlay can hang outside the frame.** `x: 1.0` puts its centre on the
+  right-hand edge, so half of it sits over the black bar. Clamping is Step 6;
+  until then it is a useful way to see that the geometry is genuinely live.
+
+**Verified:** `npm --prefix frontend run build` clean — compiled in 937ms,
+TypeScript in 2.6s, 4/4 static pages.
+
+### Interlude — the preview panel overflowed into the timeline
+
+**Files touched:** `frontend/components/layout/Panel.tsx` (one class)
+
+**New concepts:** percentage heights need a *definite* parent height; block
+containers do not stretch their children vertically; how to test a layout
+hypothesis by measuring instead of squinting.
+
+**Reported symptom:** "if video length is long it cuts into the timeline panel."
+
+Duration turned out to be a **red herring** — and that is the useful part of this
+story. Measuring the live page found the real defect immediately:
+
+| panel | section height | parent height | fills? |
+|---|---|---|---|
+| Assets | 164px | 476px | no |
+| Preview | 162px | 476px | no |
+| Properties | 72px | 476px | no |
+
+**Not one panel filled its container.** Every `<section>` was only as tall as its
+own content, in a parent more than twice as tall.
+
+#### The chain of failure
+
+`Panel`'s section had `flex min-h-0 flex-col` but no height. It sits inside a
+plain `<div>`, and a **block container does not stretch its block-level children
+vertically** — that is a flexbox behaviour, not a block one. So the section's
+height was `auto`. From there it cascades, because everything downstream is a
+percentage and a percentage of `auto` is not a number:
+
+```
+section         height: auto            ← the actual bug
+  └ body        flex-1  → nothing definite to fill
+      └ VideoPlayer   h-full  = 100% of auto → auto
+          └ <video>   max-h-full = 100% of auto → behaves as `none`
+                      max-w-full = 100% of a DEFINITE width → this one works
+```
+
+The last two lines are the whole thing. With the height cap inert and the width
+cap live, the video's height was decided by the panel's **width** ÷ its aspect
+ratio. A 16:9 video in a 1200px-wide panel wants to be 675px tall regardless of
+whether the row it lives in is 675px or 300px — so it spilled over the row and
+covered the timeline.
+
+#### Why it looked like a duration problem
+
+Because of what you do when a video is long: you drag the timeline divider **up**
+to see more of the timeline. That shrinks the `main` grid row — and the video's
+height, being width-driven, does not shrink with it. Long videos didn't cause the
+overflow; *making room for their timelines* did. Same bug at any duration, just
+easier to trigger.
+
+#### The fix
+
+```diff
+- <section className="flex min-h-0 flex-col …">
++ <section className="flex h-full min-h-0 flex-col …">
+```
+
+`h-full` gives the section a definite height, which gives the body one, which
+makes `h-full` and `max-h-full` downstream mean something, which lets
+`object-contain` letterbox the video inside the space available instead of
+overflowing it.
+
+**Verified by measurement, not by eye** — after the change, all three panels
+report `fills: true` at 476px, and the four grid rows are exactly contiguous:
+menubar 0→36, main 36→512, timeline 512→692, statusbar 692→720. No overlap.
+`npm --prefix frontend run build` clean.
+
+#### The lessons
+
+- **A percentage needs something definite to be a percentage OF.** `h-full`,
+  `max-h-full`, `flex-1` and `min-h-0` are all in this family. One `auto` high up
+  silently disables every one of them below it.
+- **Reproduce by measuring.** The reported cause (duration) and the real cause
+  (a missing class three components away) had nothing to do with each other. Four
+  numbers from `getBoundingClientRect()` settled in seconds what could have been
+  an hour of changing classes and reloading.
+- **`min-h-0` without a height is half a fix.** The codebase already had
+  `min-h-0` in all the right places — that stops flex children refusing to
+  shrink, but it cannot invent a height for a box that was never given one.
+
+### Step 3 — Drag to position
+
+**Files touched:** `frontend/features/timeline/overlayCoords.ts` (new),
+`frontend/features/timeline/timelineSlice.ts`,
+`frontend/features/timeline/components/OverlayCanvas.tsx`
+
+**New concepts:** delta-based dragging (and why absolute would feel wrong);
+selectively lifting `pointer-events`; a reducer branch that did not exist yet.
+
+#### The mirror of `xToTime`
+
+M4 converted a pixel into a second by dividing by `zoom` (pixels per second).
+M6 converts a pixel into a fraction by dividing by the frame's size in pixels.
+Same move, different unit:
+
+```ts
+export function draggedPosition(start, delta, frame) {
+  if (frame.width <= 0 || frame.height <= 0) return start;   // pre-metadata guard
+  return {
+    x: start.x + delta.dx / frame.width,
+    y: start.y + delta.dy / frame.height,
+  };
+}
+```
+
+Pure and React-free, like every other coordinate helper, so M7's snapping and
+M8's exporter can call it and get the same answer the editor gave.
+
+#### Worked example — one drag, click by click
+
+Frame is **800 × 450**. A text overlay sits at `x: 0.5, y: 0.85`. You grab it
+**20px right of its centre** and drag up and to the left.
+
+**1. `pointerdown`** at `clientX: 520, clientY: 400`.
+
+```ts
+dragStart.current = { pointerX: 520, pointerY: 400, x: 0.5, y: 0.85 };
+event.currentTarget.setPointerCapture(event.pointerId);
+dispatch(selectClip(clip.id));        // Properties panel follows your hand
+```
+
+**2. `pointermove`** to `clientX: 360, clientY: 310`:
+
+```
+dx = 360 − 520 = −160        dy = 310 − 400 = −90
+x  = 0.5  + (−160 / 800) = 0.5  − 0.2 = 0.30
+y  = 0.85 + (−90  / 450) = 0.85 − 0.2 = 0.65
+```
+
+**3. Dispatch** `updateClip({ id, patch: { transform: { …clip.transform, x: 0.30, y: 0.65 } } })`.
+
+**4. The reducer** clamps `x`/`y` to 0–1 — both already inside — and stores them.
+
+**5. Re-render**: `left: 30%`, `top: 65%`, so the overlay's centre is now 240px
+across and 292.5px down the frame. And because it is still centre-anchored, it
+moved by exactly the 160 × 90 pixels your hand did.
+
+#### Why deltas and not the pointer's absolute position
+
+The tempting version is "put the overlay wherever the cursor is". But you grabbed
+this one 20px right of its centre — so on the very first `pointermove` the centre
+would **jump 20px left** to sit under your cursor. Grab a wide caption near its
+edge and it leaps across the screen before you have moved a pixel.
+
+Working in deltas means the overlay follows your hand instead of snapping to it.
+As a bonus, we never need to know *where the frame sits in the window* — only how
+big it is, which the two ResizeObservers already track.
+
+#### Pitfall — don't read the live position mid-drag
+
+Every `pointermove` dispatches, and every dispatch re-renders this component. So
+mid-gesture, `clip.transform.x` is *already* the value the previous move wrote.
+Combine it with the total delta —
+
+```ts
+x: clip.transform.x + (event.clientX - dragStart.current.pointerX) / frame.width  // WRONG
+```
+
+— and the same movement gets added again on every single move: the overlay
+accelerates away from the cursor. Recording the position at the *start* and
+adding the total movement since is what keeps it honest. `PanelDivider` does the
+identical thing with `dragStart.size`, for the identical reason.
+
+#### Pitfall — the reducer had no branch for `transform`
+
+Step 1 added `transform?: ClipTransform` to `ClipPatch`, and Step 2 rendered
+`clip.transform`. But `updateClip` never *read* `patch.transform` — so the first
+drag dispatched a perfectly valid action that changed nothing at all.
+
+Nothing catches this. The types are satisfied on both sides: the patch is legal
+to construct and legal to hand to the reducer. Only a reader who checks that the
+reducer actually consumes the field will notice. **A type system verifies the
+shape of what you pass, never that anyone read it.**
+
+#### Pitfall — lift `pointer-events` selectively, never wholesale
+
+The container is `pointer-events-none` so the video keeps receiving clicks. To
+make an overlay draggable it needs events back — but only the overlay:
+
+```
+container   pointer-events-none     ← the whole frame stays click-through
+  └ item    pointer-events-auto     ← except exactly where an overlay is
+```
+
+Deleting `pointer-events-none` from the container instead would turn the entire
+video frame into one invisible click-blocker, breaking every future click-on-the-
+video interaction for the sake of a few small draggable boxes.
+
+Two smaller companions on the item: `touch-none`, so a touch drag isn't stolen by
+the browser to scroll the page, and `select-none`, so the caption doesn't
+highlight as you drag it. Plus `event.preventDefault()` in `pointerdown` — without
+it the browser starts its own text-selection drag and the overlay stutters as the
+two gestures fight.
+
+#### Where the clamp went, and why
+
+`draggedPosition` deliberately does **not** clamp. "An overlay never leaves the
+frame" is a rule about the data, so it lives in the reducer:
+
+```ts
+if (patch.transform !== undefined) {
+  clip.transform = {
+    ...patch.transform,
+    x: clamp(patch.transform.x, 0, 1),
+    y: clamp(patch.transform.y, 0, 1),
+  };
+}
+```
+
+Step 4's number fields and M9's project loader then inherit it for free, exactly
+as they inherit `start >= 0` and `duration >= MIN_CLIP_DURATION`. Drag far past
+the left edge and `x` computes to `−0.125`, the reducer stores `0`, and the
+overlay parks with half of itself over the letterbox bar — centre-anchored, as
+designed. Note the small consequence: having pinned at the edge, you must drag
+back *past* that point before it moves again. `PanelDivider` behaves the same way
+at `MIN_SIZE`.
+
+`scale`, `rotation` and `opacity` are left unclamped until Step 6, because
+nothing but `DEFAULT_TRANSFORM` writes them yet.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages. The page
+loads with no application errors — the seven console errors are all
+`GET 127.0.0.1:3939/health` refusals, which is the expected shape of running
+frontend-only with no Go sidecar. **The drag gesture itself was not machine-
+verified**: it needs a loaded video, and a file `<input>` cannot be driven from
+outside the browser. See the manual checks in the chat notes for this step.
+
+### Step 4 — Inspector controls
+
+**Files touched:** `frontend/features/timeline/components/Field.tsx` (new),
+`frontend/features/timeline/components/TransformFields.tsx` (new),
+`frontend/features/timeline/components/ClipInspector.tsx`,
+`frontend/features/timeline/overlayCoords.ts`,
+`frontend/features/timeline/timelineSlice.ts`
+
+**New concepts:** extract-on-second-use, done for real; two controls editing one
+value with neither being authoritative; `Partial<T>` as a single-field patch;
+rounding where imprecision *enters* rather than where it is displayed.
+
+#### The extraction
+
+`Field` and the `INPUT` class string were private helpers inside ClipInspector.
+Step 4 gave them a second consumer, so they moved to `Field.tsx`. That is the
+rule working as intended — extracting on the *first* use is guessing at a shape
+you have only seen once; waiting past the second means two copies drifting apart.
+
+The five new rows went into their own `TransformFields.tsx` rather than into
+ClipInspector, for two reasons: ClipInspector was already ~180 lines and would
+have blown past the ~300-line guideline, and "fields that edit timing and
+content" versus "fields that edit geometry" are genuinely two jobs. Result:
+
+| file | lines |
+|---|---|
+| ClipInspector.tsx | 175 |
+| TransformFields.tsx | 163 |
+| Field.tsx | 31 |
+
+#### Two controls, one value
+
+Each row is a range slider and a number box bound to the **same** `value`,
+calling the **same** `onChange`:
+
+```tsx
+<input type="range"  value={value} onChange={(e) => onChange(Number(e.target.value))} />
+<input type="number" value={value} onChange={(e) => commit(e.target.value)} />
+```
+
+There is no question of which control is authoritative, because neither is — the
+store is. Drag the slider and the box follows; type in the box and the slider
+follows. Give either one its own `useState` and they immediately drift apart.
+
+#### Worked example — the Opacity row
+
+Store holds `opacity: 1`.
+
+**Drag the slider to 0.4.** The range fires `change` with `"0.4"` →
+`onChange(0.4)` → `set({ opacity: 0.4 })` → the patch spreads to
+`{ x: 0.5, y: 0.85, scale: 1, rotation: 0, opacity: 0.4 }` → reducer stores it →
+re-render puts the slider at 0.4, the box at `0.4`, and the overlay at 40%
+opacity on the video. One dispatch, three views agreeing.
+
+**Now type in the box.** Select-all, type `0`:
+
+| keystroke | `event.target.value` | dispatched? | box shows |
+|---|---|---|---|
+| `0` | `"0"` | yes → 0 | `0` |
+| `.` | `""` | **no** | `0.` |
+| `7` | `"0.7"` | yes → 0.7 | `0.7` |
+
+The middle row is the interesting one. `"0."` is not a valid number, so the
+browser reports the value as empty; the blank guard skips the dispatch; nothing
+re-renders; and the DOM keeps your literal `0.` on screen until you type the
+digit that makes it real.
+
+That is the KeysField lesson — *keep the user's keystrokes until they parse* —
+achieved **without a draft**, because here the store and the input hold the same
+*shape* of value (a number). KeysField needed a draft only because `string[]` and
+`"Q, E"` are genuinely different shapes.
+
+#### Pitfall — round where imprecision enters, never where it is shown
+
+Dragging divides pixels by pixels, so `x` lands on values like
+`0.30124999999999996`, and a number box showing that is unusable.
+
+The tempting fix is to round in the input: `value={Number(value.toFixed(2))}`.
+**Don't.** That is a controlled input displaying something different from the
+store, which is exactly the KeysField bug in a new costume: type `0.375`, the
+store takes 0.375, the display rounds to `0.38`, and your third decimal is eaten
+as you type it.
+
+So the rounding goes where the imprecision is created and stored — one choke
+point in the reducer, alongside the clamp:
+
+```ts
+x: roundPosition(clamp(patch.transform.x, 0, 1)),
+y: roundPosition(clamp(patch.transform.y, 0, 1)),
+```
+
+Four decimals is ~0.2px at a 1920-wide export — finer than anyone can see. Drag
+freehand and the box now reads `0.3012`.
+
+#### Pitfall — `Partial<T>` keeps the spread in one place
+
+`ClipPatch.transform` carries a *whole* `ClipTransform`, so a single-field edit
+has to spread the current one. Doing that at five call sites would be five
+chances to forget a field:
+
+```ts
+function set(changes: Partial<ClipTransform>) {
+  dispatch(updateClip({ id: clip.id, patch: { transform: { ...transform, ...changes } } }));
+}
+// then: set({ x }), set({ scale }), set({ rotation }) …
+```
+
+TypeScript still checks every field name and type at the call site, and the
+spread exists exactly once.
+
+#### The Reset button, and the copy again
+
+```tsx
+onClick={() => set({ ...DEFAULT_TRANSFORM })}
+```
+
+Spread, not the constant itself — for the same reason `makeNewClip` spreads it.
+Handing the module constant into the store lets Redux Toolkit freeze it, and
+every later Reset would be resetting a frozen object.
+
+#### Units: shown in the data's own units
+
+`X` and `Y` read 0–1 rather than 0–100%. A percentage display would be friendlier
+to a newcomer, but it means a conversion in both directions and two sets of units
+in the codebase — and disagreeing units between editor and exporter is the exact
+failure M6 Step 1 chose fractions to avoid. One set of units everywhere.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages. Page
+loads with no application errors (only the expected `127.0.0.1:3939/health`
+refusals). **The controls themselves were not machine-verified** — reaching them
+needs a selected clip, which needs a loaded video.
+
+**Watch item:** `OverlayCanvas.tsx` is now 247 lines and Step 5 adds the fade
+envelope to it. If it crosses ~300, the drag handlers are the natural thing to
+lift into a hook.
+
+### Step 5 — Fade in / fade out
+
+**Files touched:** `frontend/features/timeline/clipOpacity.ts` (new),
+`frontend/features/timeline/types.ts`, `frontend/features/timeline/newClip.ts`,
+`frontend/features/timeline/timelineSlice.ts`,
+`frontend/features/timeline/components/OverlayCanvas.tsx`,
+`frontend/features/timeline/components/ClipInspector.tsx`
+
+**New concepts:** linear interpolation from first principles; multiplying an
+envelope instead of replacing a value; choosing an operator so the awkward case
+handles itself.
+
+#### Fades are timing, not geometry
+
+`fadeIn` and `fadeOut` went on `ClipBase` beside `start` and `duration` — **not**
+inside `transform`. `transform` answers "where does this sit"; fades answer "how
+does it behave over its lifetime". Two different questions, and M8 will consume
+them at different stages of the pipeline.
+
+#### Interpolation, from nothing
+
+A fade is one division. "How far through the ramp am I, as a fraction?"
+
+```ts
+if (clip.fadeIn > 0 && elapsed < clip.fadeIn) {
+  envelope = elapsed / clip.fadeIn;      // 0.2s into a 0.5s fade → 0.4 → draw at 40%
+}
+```
+
+No curve, no easing, no state. Same clip and same time in, same number out,
+forever — which is exactly what lets the editor call it on every render and M8
+call it on every exported frame and be certain they agree.
+
+#### Multiply, never replace
+
+```ts
+return clip.transform.opacity * envelope;
+```
+
+An overlay you set to 50% opacity that also fades in reaches **50%**, not 100%.
+The envelope scales what you asked for rather than overriding it. Replacing would
+silently discard a value the user deliberately set.
+
+#### Worked example — a 2s clip at t=10 with 0.5s fades
+
+Verified numerically:
+
+| time | 10.0 | 10.25 | 10.5 | 11.0 | 11.5 | 11.75 | 11.999 | 12.0 |
+|---|---|---|---|---|---|---|---|---|
+| opacity | 0.000 | 0.500 | 1.000 | 1.000 | 1.000 | 0.500 | 0.002 | 0.000 |
+
+Note `t=10.0` is **0**, not 1. At the clip's very first instant `elapsed` is 0, so
+`0 / 0.5` is 0. That is arithmetically right and visually right — a fade-in that
+started at full brightness would not be a fade. And `t=12.0` is 0 because the
+half-open interval `[start, end)` has already ended.
+
+#### The nicest line in the step
+
+```ts
+envelope = Math.min(envelope, remaining / clip.fadeOut);
+```
+
+`Math.min`, not assignment — and that single choice makes the degenerate case
+handle itself. Give a **2s** clip a **1.5s fade-in and a 1.5s fade-out** and the
+ramps overlap in the middle. Taking the smaller means whichever ramp is more
+restrictive right now wins:
+
+| time | 10.0 | 10.5 | 11.0 | 11.5 | 12.0 |
+|---|---|---|---|---|---|
+| opacity | 0.000 | 0.333 | **0.667** | 0.333 | 0.000 |
+
+The overlay simply peaks at 67% instead of reaching full. No value above 1, no
+flicker between two ramps, no validation error to show the user, no special case
+in the code. **Picking the right operator beat writing a guard clause.**
+
+### Step 6 — Guard rails + verification
+
+**Files touched:** `frontend/features/timeline/timelineSlice.ts`,
+`frontend/features/timeline/newClip.ts`, `docs/Learning.md`, `docs/Roadmap.md`,
+`CLAUDE.md`
+
+**New concepts:** an exhaustive object literal as compile-time coverage; refusing
+NaN at the door; an invariant spanning two fields; a payload field only some
+callers need.
+
+#### Every geometry field now has a rule
+
+| field | rule | why |
+|---|---|---|
+| `x`, `y` | clamp 0–1, round to 4dp | never leaves the frame; readable numbers |
+| `scale` | clamp `MIN_SCALE`–`MAX_SCALE` (0.05–20) | never invisible, never swallows the frame |
+| `rotation` | fold into one turn | 3600° is nonsense to read and re-derive |
+| `opacity` | clamp 0–1 | outside that range is meaningless to CSS and to ffmpeg |
+
+The limits are deliberately **wider than the sliders**: Step 4 offers 0.2–4 to
+drag through, the data accepts 0.05–20. The slider is a comfortable range; the
+clamp is the boundary of the sensible. Keeping them apart means a deliberately
+typed 6× is not rejected for no reason.
+
+#### Compile-time coverage, for free
+
+The transform block builds its object **field by field** rather than spreading
+`patch.transform`:
+
+```ts
+clip.transform = {
+  x: roundPosition(clamp(finiteOr(next.x, DEFAULT_TRANSFORM.x), 0, 1)),
+  y: …, scale: …, rotation: …, opacity: …,
+};
+```
+
+If `ClipTransform` ever gains a sixth field, this literal **stops compiling**
+until that field is given a rule here. A spread would have silently let it
+through unguarded. The same trick as the discriminated union in M5: arrange the
+types so the compiler asks the question you would otherwise have to remember.
+
+#### Refusing NaN at the door
+
+```ts
+function finiteOr(value: number, fallback: number): number {
+  return Number.isFinite(value) ? value : fallback;
+}
+```
+
+A NaN in geometry is uniquely nasty: it renders as `transform: scale(NaN)`, the
+overlay silently disappears, and **nothing anywhere reports an error**. Not a
+crash, not a console warning — just a missing overlay and a confused user. One
+guard at the single point where geometry is written closes it for every caller,
+including M9's file loader.
+
+#### The rotation wrap, and JavaScript's `%`
+
+```ts
+return ((((degrees + 180) % 360) + 360) % 360) - 180;
+```
+
+That double-modulo dance exists because JavaScript's `%` keeps the **sign of the
+left operand**: `-90 % 360` is `-90`, not `270`. Verified:
+
+| in | 370 | 730 | 359 | −90 | −270 | −370 |
+|---|---|---|---|---|---|---|
+| out | 10 | 10 | −1 | −90 | 90 | −10 |
+
+#### An invariant that spans two fields
+
+Shortening a clip must not leave a fade longer than the clip:
+
+```ts
+clip.duration = clamp(…);
+clip.fadeIn  = Math.min(clip.fadeIn,  clip.duration);
+clip.fadeOut = Math.min(clip.fadeOut, clip.duration);
+```
+
+Set a 4s clip to fade in over 3s, then drag its Length down to 1s. Without those
+two lines you have a 1s clip carrying a 3s fade — a state no form validated,
+because no single field was invalid. **The invalid thing was the combination**,
+which is precisely why it has to live where the data changes.
+
+#### The M5 leftover, finally fixed
+
+M5's verification pass noted: *"`clip.start` is never clamped against the video's
+length. You can retime an overlay to second 5000 of a 1320-second video."* Now:
+
+```ts
+const latestStart =
+  videoEnd === null ? Infinity : Math.max(0, videoEnd - MIN_CLIP_DURATION);
+clip.start = clamp(finiteOr(patch.start, clip.start), 0, latestStart);
+```
+
+The interesting part is *how the reducer learned the video's length*. `duration`
+lives in the **player** slice; this is the **timeline** slice. So it arrives in the
+payload, exactly as the viewport actions carry `bounds`:
+
+```ts
+action: PayloadAction<{ id: string; patch: ClipPatch; videoDuration?: number }>
+```
+
+It is **optional** on purpose, and that deserves justification rather than being
+waved through. Only a patch touching `start` or `duration` can violate this rule;
+the drag and the geometry sliders cannot. Making it required would force every
+transform-only caller to reach into another slice for a number it has no use for.
+The trade-off: a future caller editing `start` could forget to pass it. That risk
+is accepted because the field is visible in the action's type, which is where the
+next person will look.
+
+Note also the guard on the value itself:
+
+```ts
+videoDuration > 0 ? videoDuration : null
+```
+
+Before metadata loads, `duration` is `0`. Clamping against 0 would collapse every
+clip to the very start of the video — a bug that only appears in the moment
+between opening a file and its metadata arriving, and would have been miserable to
+reproduce.
+
+#### The M6 manual checklist
+
+Types and builds cannot see any of this. Only clicking can.
+
+1. Open a video, add **+ Text** → it appears bottom-centre, as in M5.
+2. Add **+ Keys** at the same second → the two overlap. *Expected*: both start at
+   the same default position.
+3. Drag them apart. Cursor reads `grab`, then `grabbing`.
+4. Grab an overlay **near its edge** → it follows your hand with no initial jump.
+5. Drag hard past the left edge → it stops with half of itself over the black bar
+   (centre-anchored). Drag back — expect a short dead zone first.
+6. Click the video **away from any overlay** → behaves as before. The selective
+   `pointer-events` lift is intact.
+7. Drag an unselected overlay → it selects on grab; Properties follows.
+8. **Rotation** 45 then −45 → spins about its own centre, not a corner.
+9. **Scale** 4 then 0.2, then resize the preview panel → scale and frame size
+   compound rather than fight.
+10. **Reset** → all five snap back. Press it **twice**; the second must also work
+    (the frozen-constant trap).
+11. Type `0.35` into a number box → the decimal point survives the keystroke.
+12. **Fade in** 0.5 on a 2s clip → scrub slowly across its start; it ramps up
+    rather than popping. At the exact first frame it is invisible.
+13. Fade in **1.5** and fade out **1.5** on a **2s** clip → it peaks part-way, no
+    flicker at the crossover.
+14. Set fade in 3 on a 4s clip, then set Length to 1 → the fade follows down to 1.
+15. Set **Start** beyond the end of the video → it stops at
+    `videoLength − 0.5`, not past the end.
+16. Reload → everything is gone. *Expected*: persistence is M9.
+
+#### Verification status — read this honestly
+
+| gate | result |
+|---|---|
+| `npm --prefix frontend run build` | ✅ clean, 4/4 static pages, TypeScript 1.2s |
+| Page loads without app errors | ✅ only `127.0.0.1:3939/health` refusals (no sidecar) |
+| Fade + rotation arithmetic | ✅ verified numerically against the tables above |
+| `npm run build` (full gate) | ⛔ **cannot run on this machine** |
+| Manual checklist (16 items) | ⛔ **not yet run** |
+
+The full gate is blocked by the environment, not by the code: npm invokes it
+through `powershell -File scripts/…`, and a nested PowerShell here is denied
+permission to launch any executable — `where.exe` fails identically, while
+`cmd.exe` launching the same binary succeeds. MSVC build tools are also absent, so
+Rust could compile but not link. **M6 is therefore frontend-verified, not
+fully-gated**, and should not be recorded as green until both are resolved.
+
 ## Appendix — file map (M2 so far)
 
 | File | Role |
@@ -1224,7 +2074,7 @@ had been `<=` and every overlay flickered at its boundary. Types check
 | `frontend/components/layout/EditorShell.tsx` | the one grid that holds the entire editor |
 | `frontend/components/layout/MenuBar.tsx` | top menu bar; dropdown menus, View → Reset Layout dispatches resetLayout |
 | `frontend/components/layout/StatusBar.tsx` | bottom bar; reads backend status + fires health check |
-| `frontend/components/layout/Panel.tsx` | generic panel: title + children slot |
+| `frontend/components/layout/Panel.tsx` | generic panel: title + children slot; `h-full` so percentage heights inside resolve |
 | `frontend/components/layout/PanelDivider.tsx` | drag handle (oriented vertical/horizontal) → resizePanel |
 | `frontend/utils/clamp.ts` | clamp(value, min, max) helper |
 | `frontend/features/system/…` | system slice + selectors + status presentation + backend client |
@@ -1233,7 +2083,9 @@ had been `<=` and every overlay flickered at its boundary. Types check
 | `frontend/features/layout/components/AssetsPanel.tsx` | left panel: placeholder asset list |
 | `frontend/features/layout/components/PreviewPanel.tsx` | center panel: video preview placeholder |
 | `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: renders ClipInspector for the selected clip |
-| `frontend/features/timeline/components/ClipInspector.tsx` | edit form for the selected clip: name, start, length, per-kind props, delete |
+| `frontend/features/timeline/components/ClipInspector.tsx` | edit form for the selected clip: name, start, length, per-kind props, delete; renders TransformFields |
+| `frontend/features/timeline/components/Field.tsx` | shared labelled form row + INPUT class string (extracted on its second use) |
+| `frontend/features/timeline/components/TransformFields.tsx` | geometry half of the form: X/Y/Scale/Rotation/Opacity as slider+number pairs, plus Reset |
 | `frontend/features/layout/components/TimelinePanel.tsx` | bottom: ruler + empty track placeholder |
 | `frontend/features/player/playerSlice.ts` | player state + videoOpened/seekBy/setTime/… |
 | `frontend/features/player/playerSelectors.ts` | selectPlayer |
@@ -1245,11 +2097,13 @@ had been `<=` and every overlay flickered at its boundary. Types check
 | `frontend/features/timeline/timelineSlice.ts` | viewport (zoom, viewportStart) + clip data; setZoom/panBy/zoomAt/fitToWindow/clampViewport, addClip/selectClip/updateClip/deleteClip |
 | `frontend/features/timeline/timelineSelectors.ts` | selectTimeline / selectZoom / selectViewportStart / selectTracks / selectSelectedClipId |
 | `frontend/features/timeline/timelineCoords.ts` | pure timeToX / xToTime / tickStep / visibleTicks + viewport limits (minZoomFor / maxViewportStart) |
-| `frontend/features/timeline/types.ts` | overlay data model: KeyboardClip \| TextClip union, Track, ClipPatch (absolute seconds) |
+| `frontend/features/timeline/types.ts` | overlay data model: KeyboardClip \| TextClip union, Track, ClipPatch, ClipTransform (absolute seconds; geometry as 0–1 fractions) |
 | `frontend/features/timeline/activeClips.ts` | pure isClipActive / activeClipsAt — which overlays are live at second T |
-| `frontend/features/timeline/newClip.ts` | pure makeNewClip — defaults for a freshly added overlay |
+| `frontend/features/timeline/clipOpacity.ts` | pure clipOpacityAt — the fade envelope multiplied into the clip's base opacity |
+| `frontend/features/timeline/newClip.ts` | pure makeNewClip + DEFAULT_TRANSFORM — defaults for a freshly added overlay |
+| `frontend/features/timeline/overlayCoords.ts` | pure draggedPosition + roundPosition — pointer pixels → 0–1 frame fractions (mirror of xToTime) |
 | `frontend/features/timeline/components/TimelineToolbar.tsx` | + Keys / + Text at the playhead, and Fit |
-| `frontend/features/timeline/components/OverlayCanvas.tsx` | draws the live overlays on the video preview; measures the video box |
+| `frontend/features/timeline/components/OverlayCanvas.tsx` | draws the live overlays on the video preview; measures the video box; places each overlay from its own ClipTransform (centre-anchored, frame-relative scale); drag-to-position with pointer capture |
 | `frontend/features/timeline/components/Timeline.tsx` | ruler + track lanes + playhead; scrub-drag, wheel zoom/pan, Fit; TimelinePanel renders it |
 | `frontend/features/timeline/components/ClipBlock.tsx` | one overlay drawn as a block; presentational, colour per kind, click to select |
 

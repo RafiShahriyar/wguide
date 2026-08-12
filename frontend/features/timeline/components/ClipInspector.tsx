@@ -2,44 +2,46 @@
 
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
-import { useAppDispatch } from "@/hooks/useRedux";
+import { useEffect, useState } from "react";
+import { useAppDispatch, useAppSelector } from "@/hooks/useRedux";
 import { formatTime } from "@/features/player/formatTime";
 import { seekTo } from "@/features/player/playerSlice";
+import { selectPlayer } from "@/features/player/playerSelectors";
 import { deleteClip, updateClip } from "@/features/timeline/timelineSlice";
+import { Field, INPUT } from "./Field";
+import { TransformFields } from "./TransformFields";
 import type { KeyboardClip, OverlayClip } from "@/features/timeline/types";
 
 // The editing form for the selected clip. Every input is CONTROLLED by the
 // store: what you see is `clip.x`, and typing dispatches `updateClip`, which
 // re-renders this form from the new store value. There is no second copy of
 // the truth — except for one deliberate case, see `keysDraft` below.
-
-const INPUT =
-  "w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-100 outline-none focus:border-emerald-600";
-
-// Used for every row, so the label/spacing rules live in one place.
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-[10px] uppercase tracking-wider text-zinc-500">
-        {label}
-      </span>
-      {children}
-    </label>
-  );
-}
+//
+// `Field` and `INPUT` used to live here. Step 4 moved them to their own file
+// once TransformFields needed them too.
 
 export function ClipInspector({ clip }: { clip: OverlayClip }) {
   const dispatch = useAppDispatch();
+  // The video's length lives in the PLAYER slice, but the timeline reducer needs
+  // it to stop a clip being retimed past the end of the footage. So this form
+  // reads it and passes it in the payload — the same arrangement the viewport
+  // actions use for `bounds`. The reducer stays pure and the dependency is
+  // visible in the action's type instead of hidden inside it.
+  const { duration: videoDuration } = useAppSelector(selectPlayer);
 
   // Number inputs report strings. Number("") is 0, so an empty box would jump
   // the value to 0 as you clear it — we ignore blank input instead and let the
   // reducer clamp whatever does parse.
-  function patchNumber(field: "start" | "duration", raw: string) {
+  function patchNumber(
+    field: "start" | "duration" | "fadeIn" | "fadeOut",
+    raw: string,
+  ) {
     if (raw.trim() === "") return;
     const value = Number(raw);
     if (!Number.isFinite(value)) return;
-    dispatch(updateClip({ id: clip.id, patch: { [field]: value } }));
+    dispatch(
+      updateClip({ id: clip.id, patch: { [field]: value }, videoDuration }),
+    );
   }
 
   return (
@@ -92,6 +94,31 @@ export function ClipInspector({ clip }: { clip: OverlayClip }) {
         </Field>
       </div>
 
+      {/* Fades are timing, so they belong here with Start and Length rather than
+          in the Transform section. */}
+      <div className="flex gap-2">
+        <Field label="Fade in (s)">
+          <input
+            className={INPUT}
+            type="number"
+            step={0.1}
+            min={0}
+            value={clip.fadeIn}
+            onChange={(event) => patchNumber("fadeIn", event.target.value)}
+          />
+        </Field>
+        <Field label="Fade out (s)">
+          <input
+            className={INPUT}
+            type="number"
+            step={0.1}
+            min={0}
+            value={clip.fadeOut}
+            onChange={(event) => patchNumber("fadeOut", event.target.value)}
+          />
+        </Field>
+      </div>
+
       {clip.kind === "keyboard" ? (
         <KeysField clip={clip} />
       ) : (
@@ -131,6 +158,8 @@ export function ClipInspector({ clip }: { clip: OverlayClip }) {
           </Field>
         </>
       )}
+
+      <TransformFields clip={clip} />
 
       <button
         type="button"

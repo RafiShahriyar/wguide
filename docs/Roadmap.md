@@ -13,7 +13,7 @@ rotations (e.g. Wuthering Waves, Genshin, ZZZ).
 | 3 | Video Player | Open videos, play/pause, seek, current-time display | ✅ |
 | 4 | Timeline Engine | Custom timeline: playhead, drag, zoom, scroll | ✅ |
 | 5 | Overlay Engine | Keyboard / mouse / arrow / text / image overlays on one interface | ✅ keyboard + text |
-| 6 | Property Inspector | Opacity, scale, rotation, position, animation, duration | ⬜ Next |
+| 6 | Property Inspector | Opacity, scale, rotation, position, animation, duration | 🔨 code complete, frontend-verified (full gate + checklist pending) |
 | 7 | Timeline Editing | Move, resize, delete, duplicate, multi-select, snap | ⬜ |
 | 8 | Rendering | Timeline -> Go backend -> ffmpeg -> MP4 export | ⬜ |
 | 9 | Project Files | New / open / save / save-as (`guideforge.project`) | ⬜ |
@@ -51,7 +51,12 @@ acceptance criteria in its PR/commit). Examples:
   Properties panel edits name / start / length / keys / text / colour, and
   Delete removes both the block and the overlay.
 
-**Known gaps after M5** (deliberate, scheduled): nothing persists across a
-restart (M9), clips cannot be dragged or resized on the timeline (M7), overlays
-have no position or size of their own (M6), and only the `keyboard` and `text`
-kinds exist — mouse / arrow / image are still to come.
+- **M6**: each overlay has its own position, scale, rotation and opacity; drag an
+  overlay on the video to move it; the five sliders and number boxes edit it live;
+  Reset restores the defaults; fade in/out ramp it rather than popping; and a clip
+  can no longer be retimed past the end of the footage.
+
+**Known gaps after M6** (deliberate, scheduled): nothing persists across a
+restart (M9), clips cannot be dragged or resized on the timeline (M7), there is no
+keyframed animation (values changing over time), and only the `keyboard` and
+`text` kinds exist — mouse / arrow / image are still to come.
