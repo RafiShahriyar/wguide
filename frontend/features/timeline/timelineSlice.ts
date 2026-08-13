@@ -72,7 +72,13 @@ export interface TimelineState {
   // the overlay data: vertical lanes of clips
   tracks: Track[];
   // which clip the Properties panel is editing (null = none)
-  selectedClipId: string | null;
+  // Which clips the Properties panel is editing and a drag would move. An array
+  // rather than a single id: everything downstream now has to cope with 0, 1 or N.
+  selectedClipIds: string[];
+  // The clip a Shift-click measures its range FROM — the last one clicked
+  // deliberately. Kept separate from the selection because the selection is a SET
+  // with no meaningful order, while "the one you clicked last" is its own fact.
+  selectionAnchorId: string | null;
 }
 
 function makeDefaultTrack(): Track {
@@ -83,7 +89,8 @@ const initialState: TimelineState = {
   zoom: DEFAULT_ZOOM,
   viewportStart: 0,
   tracks: [makeDefaultTrack()],
-  selectedClipId: null,
+  selectedClipIds: [],
+  selectionAnchorId: null,
 };
 
 const timelineSlice = createSlice({
@@ -165,10 +172,161 @@ const timelineSlice = createSlice({
     addClip(state, action: PayloadAction<NewOverlayClip>) {
       const clip: OverlayClip = { id: crypto.randomUUID(), ...action.payload };
       state.tracks[0].clips.push(clip);
-      state.selectedClipId = clip.id;
+      state.selectedClipIds = [clip.id];
+      state.selectionAnchorId = clip.id;
     },
+    // Plain click: this clip and nothing else. `null` clears the selection.
     selectClip(state, action: PayloadAction<string | null>) {
-      state.selectedClipId = action.payload;
+      state.selectedClipIds = action.payload === null ? [] : [action.payload];
+      state.selectionAnchorId = action.payload;
+    },
+    // Ctrl/Cmd-click: add if absent, remove if present.
+    toggleClipSelection(state, action: PayloadAction<string>) {
+      const id = action.payload;
+      state.selectedClipIds = state.selectedClipIds.includes(id)
+        ? state.selectedClipIds.filter((selected) => selected !== id)
+        : [...state.selectedClipIds, id];
+      state.selectionAnchorId = id;
+    },
+    // Shift-click: everything between the anchor and this clip, within the track
+    // that holds them both. Ordered by START time, not by array order — the clips
+    // array is in creation order, and "between" has to mean between in TIME or the
+    // selection would look arbitrary.
+    selectClipRange(state, action: PayloadAction<string>) {
+      const toId = action.payload;
+      const anchorId = state.selectionAnchorId;
+
+      const track =
+        anchorId === null
+          ? undefined
+          : state.tracks.find(
+              (candidate) =>
+                candidate.clips.some((clip) => clip.id === anchorId) &&
+                candidate.clips.some((clip) => clip.id === toId),
+            );
+
+      // No anchor, or the two clips are in different tracks: fall back to a plain
+      // selection rather than guessing at what the user meant.
+      if (anchorId === null || anchorId === toId || !track) {
+        state.selectedClipIds = [toId];
+        state.selectionAnchorId = toId;
+        return;
+      }
+
+      const anchor = track.clips.find((clip) => clip.id === anchorId)!;
+      const target = track.clips.find((clip) => clip.id === toId)!;
+      const low = Math.min(anchor.start, target.start);
+      const high = Math.max(anchor.start, target.start);
+
+      state.selectedClipIds = track.clips
+        .filter((clip) => clip.start >= low && clip.start <= high)
+        .map((clip) => clip.id);
+      // The anchor deliberately does NOT move: shift-clicking again re-measures
+      // from the same place, which is what makes a range adjustable.
+    },
+    // Move every clip in a group by one shared delta.
+    //
+    // This is a separate action rather than N `updateClip` dispatches, and the
+    // reason is the clamp below. Each caller passes the start to measure FROM: for
+    // a drag that is where the clip sat when the gesture began (every dispatch
+    // re-renders, so reading the live value mid-drag compounds); for a keyboard
+    // nudge it is simply the clip's current start. Hence `fromStart` rather than
+    // anything drag-specific — the action serves both callers unchanged.
+    moveClips(
+      state,
+      action: PayloadAction<{
+        moves: Array<{ id: string; fromStart: number }>;
+        deltaSeconds: number;
+        videoDuration?: number;
+      }>,
+    ) {
+      const { moves, deltaSeconds, videoDuration } = action.payload;
+      if (moves.length === 0) return;
+
+      const videoEnd =
+        videoDuration !== undefined &&
+        Number.isFinite(videoDuration) &&
+        videoDuration > 0
+          ? videoDuration
+          : null;
+      const latestStart =
+        videoEnd === null ? Infinity : Math.max(0, videoEnd - MIN_CLIP_DURATION);
+
+      // Clamp the DELTA once for the whole group — never each clip on its own.
+      // Clamping per clip would let the leftmost stop at 0:00 while the others
+      // carried on, and the relative spacing between them, the very thing you
+      // selected them together to preserve, would be destroyed. Only code that can
+      // see every clip at once can enforce that, which is why this action exists.
+      let allowed = finiteOr(deltaSeconds, 0);
+      for (const move of moves) {
+        allowed = clamp(allowed, -move.fromStart, latestStart - move.fromStart);
+      }
+
+      for (const move of moves) {
+        const clip = findClip(state, move.id);
+        if (clip) clip.start = move.fromStart + allowed;
+      }
+    },
+    // Copy every selected clip and drop the copies immediately after the group.
+    duplicateClips(
+      state,
+      action: PayloadAction<{ ids: string[]; videoDuration?: number }>,
+    ) {
+      const wanted = new Set(action.payload.ids);
+      const originals: OverlayClip[] = [];
+      for (const track of state.tracks) {
+        for (const clip of track.clips) {
+          if (wanted.has(clip.id)) originals.push(clip);
+        }
+      }
+      if (originals.length === 0) return;
+
+      // The copies are shifted by the SPAN of the whole selection, so the new group
+      // lands just past the old one with its internal spacing intact. Offsetting
+      // each clip by its own length instead would scramble a group's rhythm — the
+      // same reasoning as the shared delta in moveClips.
+      const groupStart = Math.min(...originals.map((clip) => clip.start));
+      const groupEnd = Math.max(
+        ...originals.map((clip) => clip.start + clip.duration),
+      );
+
+      const videoEnd =
+        action.payload.videoDuration !== undefined &&
+        Number.isFinite(action.payload.videoDuration) &&
+        action.payload.videoDuration > 0
+          ? action.payload.videoDuration
+          : null;
+      const latestStart =
+        videoEnd === null ? Infinity : Math.max(0, videoEnd - MIN_CLIP_DURATION);
+
+      // One shared offset, narrowed until every copy fits inside the footage. If
+      // there is no room at all this collapses to 0 and the copies land on top of
+      // the originals — visible and draggable, which beats silently creating clips
+      // beyond the end of the video where nothing would ever render them.
+      let offset = groupEnd - groupStart;
+      for (const clip of originals) {
+        offset = Math.min(offset, latestStart - clip.start);
+      }
+      offset = Math.max(0, offset);
+
+      const copies: string[] = [];
+      for (const track of state.tracks) {
+        // Collect first, push after: growing `track.clips` while iterating it would
+        // walk into the copies and duplicate them again, forever.
+        const additions: OverlayClip[] = [];
+        for (const clip of track.clips) {
+          if (!wanted.has(clip.id)) continue;
+          const copy = copyClip(clip, offset);
+          additions.push(copy);
+          copies.push(copy.id);
+        }
+        track.clips.push(...additions);
+      }
+
+      // Select the copies, not the originals: the thing you almost always want next
+      // is to drag what you just made.
+      state.selectedClipIds = copies;
+      state.selectionAnchorId = copies[copies.length - 1] ?? null;
     },
 updateClip(
       state,
@@ -270,14 +428,51 @@ updateClip(
         };
       }
     },
-    deleteClip(state, action: PayloadAction<string>) {
+    // Delete a whole set at once. A Set for the lookup so deleting 50 clips from
+    // 500 stays linear rather than quadratic.
+    deleteClips(state, action: PayloadAction<string[]>) {
+      const doomed = new Set(action.payload);
+      if (doomed.size === 0) return;
       for (const track of state.tracks) {
-        track.clips = track.clips.filter((c) => c.id !== action.payload);
+        track.clips = track.clips.filter((clip) => !doomed.has(clip.id));
       }
-      if (state.selectedClipId === action.payload) state.selectedClipId = null;
+      state.selectedClipIds = state.selectedClipIds.filter(
+        (id) => !doomed.has(id),
+      );
+      if (state.selectionAnchorId !== null && doomed.has(state.selectionAnchorId)) {
+        state.selectionAnchorId = null;
+      }
     },
   },
 });
+
+// A copy of a clip with a fresh id, shifted in time.
+//
+// Every nested value is copied explicitly. `{ ...clip, id: newId }` would hand the
+// copy the SAME `transform` object and the same `props.keys` array as the original —
+// two clips sharing one piece of mutable state, which is the trap
+// `{ ...DEFAULT_TRANSFORM }` avoided in M6. It happens to be harmless today because
+// `updateClip` replaces those objects wholesale rather than mutating them, but that
+// is a property of code somewhere else that could change at any time.
+//
+// The fields are also listed one by one rather than spread, so a new field on
+// ClipBase stops this compiling until it has been considered here — the same
+// compile-time coverage the transform block gets in `updateClip`.
+function copyClip(clip: OverlayClip, offsetSeconds: number): OverlayClip {
+  const base = {
+    id: crypto.randomUUID(),
+    name: clip.name,
+    start: clip.start + offsetSeconds,
+    duration: clip.duration,
+    fadeIn: clip.fadeIn,
+    fadeOut: clip.fadeOut,
+    transform: { ...clip.transform },
+  };
+
+  return clip.kind === "keyboard"
+    ? { ...base, kind: "keyboard", props: { keys: [...clip.props.keys] } }
+    : { ...base, kind: "text", props: { ...clip.props } };
+}
 
 // Small pure helper: find a clip by id across all tracks (used by reducers).
 function findClip(state: TimelineState, id: string): OverlayClip | undefined {
@@ -297,8 +492,12 @@ export const {
   clampViewport,
   addClip,
   selectClip,
+  toggleClipSelection,
+  selectClipRange,
+  moveClips,
+  duplicateClips,
   updateClip,
-  deleteClip,
+  deleteClips,
 } = timelineSlice.actions;
 
 export default timelineSlice.reducer;

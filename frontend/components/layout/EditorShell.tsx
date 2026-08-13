@@ -12,10 +12,15 @@ import { TimelinePanel } from "@/features/layout/components/TimelinePanel";
 import { useAppSelector } from "@/hooks/useRedux";
 import { selectPanels } from "@/features/layout/layoutSelectors";
 import { usePlayerShortcuts } from "@/features/player/hooks/usePlayerShortcuts";
+import { useTimelineShortcuts } from "@/features/timeline/hooks/useTimelineShortcuts";
 
 export function EditorShell() {
   const panels = useAppSelector(selectPanels);
+  // Two window-level keyboard listeners, deliberately kept apart: one owns
+  // playback keys, the other owns editing keys. They share no bindings — see the
+  // note about , and . in useTimelineShortcuts.
   usePlayerShortcuts();
+  useTimelineShortcuts();
 
   return (
     // CSS Grid lays out the four big rows. grid-template-areas lets us

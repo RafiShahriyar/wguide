@@ -7,7 +7,7 @@ import { useAppDispatch, useAppSelector } from "@/hooks/useRedux";
 import { formatTime } from "@/features/player/formatTime";
 import { seekTo } from "@/features/player/playerSlice";
 import { selectPlayer } from "@/features/player/playerSelectors";
-import { deleteClip, updateClip } from "@/features/timeline/timelineSlice";
+import { deleteClips, updateClip } from "@/features/timeline/timelineSlice";
 import { Field, INPUT } from "./Field";
 import { TransformFields } from "./TransformFields";
 import type { KeyboardClip, OverlayClip } from "@/features/timeline/types";
@@ -52,7 +52,9 @@ export function ClipInspector({ clip }: { clip: OverlayClip }) {
         </span>
         <button
           type="button"
-          onClick={() => dispatch(deleteClip(clip.id))}
+          // One clip, but the same action the group path uses — one way to delete
+          // rather than a single and a plural version drifting apart.
+          onClick={() => dispatch(deleteClips([clip.id]))}
           className="rounded border border-red-900 px-2 py-0.5 text-[10px] text-red-400 hover:bg-red-950"
         >
           Delete

@@ -14,7 +14,7 @@ rotations (e.g. Wuthering Waves, Genshin, ZZZ).
 | 4 | Timeline Engine | Custom timeline: playhead, drag, zoom, scroll | ✅ |
 | 5 | Overlay Engine | Keyboard / mouse / arrow / text / image overlays on one interface | ✅ keyboard + text |
 | 6 | Property Inspector | Opacity, scale, rotation, position, animation, duration | 🔨 code complete, frontend-verified (full gate + checklist pending) |
-| 7 | Timeline Editing | Move, resize, delete, duplicate, multi-select, snap | ⬜ |
+| 7 | Timeline Editing | Move, resize, delete, duplicate, multi-select, snap | 🔨 code complete, frontend-verified (full gate + checklist pending) |
 | 8 | Rendering | Timeline -> Go backend -> ffmpeg -> MP4 export | ⬜ |
 | 9 | Project Files | New / open / save / save-as (`guideforge.project`) | ⬜ |
 | 10 | Polish | Shortcuts, undo/redo, settings, themes, autosave, crash recovery | ⬜ |
@@ -56,7 +56,18 @@ acceptance criteria in its PR/commit). Examples:
   Reset restores the defaults; fade in/out ramp it rather than popping; and a clip
   can no longer be retimed past the end of the footage.
 
-**Known gaps after M6** (deliberate, scheduled): nothing persists across a
-restart (M9), clips cannot be dragged or resized on the timeline (M7), there is no
-keyframed animation (values changing over time), and only the `keyboard` and
-`text` kinds exist — mouse / arrow / image are still to come.
+- **M7**: drag a block to retime it, drag either end to trim it (the left end holds
+  the clip's finish still), edges snap to the playhead and to neighbouring clips with
+  Alt to bypass, Ctrl-click and Shift-click build a multi-selection that drags as one
+  group without losing its spacing, Ctrl+D duplicates, `,`/`.` nudge and Delete
+  removes.
+
+**Known gaps after M7** (deliberate, scheduled): nothing persists across a
+restart (M9), there is no keyframed animation (values changing over time), only the
+`keyboard` and `text` kinds exist — mouse / arrow / image are still to come — there
+is only one track so clips cannot be dragged between lanes, no undo/redo (M10), and
+no auto-pan while dragging near the edge of the viewport (M10).
+
+**Also open:** opening a *shorter* video leaves existing clips beyond its end, because
+every clamp runs when a value is written and here the bounds move underneath it. Needs
+a `clampClipsToVideo` action; M9's project loader will want the same one.

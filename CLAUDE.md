@@ -104,19 +104,40 @@ Milestones (see `docs/Roadmap.md`, table):
   `npm run build` gate could not run on this machine (see §10) and the 16-item
   checklist in `docs/Learning.md` → "Step 6" has **NOT been run**. Do not record
   M6 as green until both are done.
-- 🔨 **M7 Timeline Editing — NEXT.** No plan presented yet; present a numbered
-  step plan and wait for "go".
-- ⬜ M8 Rendering (ffmpeg MP4), M9 Project Files (guideforge.project JSON),
-  M10 Polish.
+- ✅ **M7 Timeline Editing** — all 6 steps done: 1) drag a block to retime
+  2) drag either end to trim 3) snapping + Alt bypass + amber guide line
+  4) multi-select (`selectedClipIds`) with group drag 5) Ctrl+D duplicate,
+  `,`/`.` nudge, keyboard Delete 6) invariant review + 32-item checklist.
+  **Frontend-verified only**, same as M6: full `npm run build` blocked (§10) and
+  the checklist in `docs/Learning.md` → "The M7 manual checklist" has **NOT** been
+  run.
+- 🔨 **M8 Rendering — NEXT.** No plan presented yet; present a numbered step plan
+  and wait for "go". ⚠️ M8 is the first milestone that CANNOT be built
+  frontend-only: it needs ffmpeg, a working `npm run dev`, and Rust linking. See
+  §10 — that environment work is now on the critical path.
+- ⬜ M9 Project Files (guideforge.project JSON), M10 Polish.
+
+**Three manual checklists are outstanding**: M5 (10 items), M6 (16), M7 (32). The
+overlap is deliberate — M7 rewrote the gesture handling M5 and M6 relied on, so
+running M7's list re-exercises much of the earlier behaviour.
 
 M5 deferred on purpose: mouse/arrow/image kinds; move/resize/snap and
 multi-select (M7); per-overlay position/size (M6); persistence (M9) — clips
 vanish on restart.
 
 Git state:
-- `main` = M1→M5. `dev` was merged into `main` via PR #4 (commit `fe0cae1`), so
-  main is current through M5. M6 currently exists only as uncommitted
-  working-tree changes on top of it.
+- `main` = M1→M5 (`fe0cae1`, dev merged via PR #4). **Nothing since has reached
+  GitHub yet.**
+- M6 is committed locally on `feature/m6-property-inspector`; M7 sits on top of it.
+  `git config --global user.name/user.email` are now set to
+  `Rafi Shahriyar <rafi.shahriyar@g.bracu.ac.bd>`.
+- ⚠️ **Pushing cannot be done by the agent.** Git Credential Manager has no cached
+  token in this environment and tries to open an interactive login, which fails with
+  "could not read Username for 'https://github.com': terminal prompts disabled". `gh`
+  CLI is not installed either. The user must run `git push -u origin
+  feature/m6-property-inspector` in their own terminal once (browser/device-code
+  prompt), after which the token is cached. Then the PR can be opened on GitHub, or
+  `gh` installed (`winget install --id GitHub.cli -e`) and the agent can do it.
 - `feature/m4-m5-timeline-overlays` holds the same work as one commit.
 - Strategy: `main` stable, `dev` integration (squash-merge features),
   `feature/<milestone>` branches. Remote: github.com/RafiShahriyar/wguide.
@@ -194,9 +215,47 @@ New/changed model: `ClipTransform { x, y, scale, rotation, opacity }` on
 `updateClip`'s payload gained an optional `videoDuration` so the reducer can hold
 clips inside the footage.
 
-**Explicitly NOT in M6, still open:** keyframed animation (values changing over
-time — a much bigger model change), the mouse/arrow/image kinds, timeline
-drag/resize/snap (M7), persistence (M9).
+**Explicitly NOT in M6:** keyframed animation (values changing over time — a much
+bigger model change), the mouse/arrow/image kinds, persistence (M9).
+
+## 5c. M7 — what shipped
+
+M7 made the timeline editable. Model change: `selectedClipId: string | null` became
+`selectedClipIds: string[]`, plus `selectionAnchorId` (what a Shift-click measures a
+range *from* — separate because a selection is an unordered set and "last clicked" is
+its own fact).
+
+New actions, replacing the single-selection ones:
+
+| action | notes |
+|---|---|
+| `selectClip(id \| null)` | plain click; `null` clears |
+| `toggleClipSelection(id)` | Ctrl/Cmd-click |
+| `selectClipRange(id)` | Shift-click; anchor → clip, ordered by **start time**, same track only |
+| `moveClips({ moves, deltaSeconds, videoDuration? })` | group move; `moves` carry `fromStart` |
+| `duplicateClips({ ids, videoDuration? })` | copies shift by the selection's SPAN; the copies get selected |
+| `deleteClips(ids)` | replaces `deleteClip`; prunes selection + anchor |
+
+**Keyboard map — check this before adding any shortcut.** Two `window` listeners are
+mounted side by side in `EditorShell` and they share **no** bindings, deliberately:
+
+| key | owner | action |
+|---|---|---|
+| Space | `usePlayerShortcuts` | play/pause |
+| ← / → | `usePlayerShortcuts` | seek ±5s (Shift: ±0.1s) |
+| Ctrl/Cmd+O | `usePlayerShortcuts` | open a video |
+| Delete / Backspace | `useTimelineShortcuts` | delete the selection |
+| Ctrl/Cmd+D | `useTimelineShortcuts` | duplicate (must `preventDefault` — browser bookmark) |
+| `,` / `.` | `useTimelineShortcuts` | nudge ∓0.1s (Shift: ∓1s) |
+| Alt (held) | `Timeline` gesture | bypass snapping |
+
+Arrows were **not** available for nudging — the player owns them twice. Both hooks
+skip everything when `isTypingTarget(event.target)`.
+
+**Explicitly NOT in M7:** dragging clips between lanes (there is exactly ONE track —
+`track-overlays`, hardcoded in `makeDefaultTrack`, and `addClip` always pushes to
+`tracks[0]`; multi-track is a feature in its own right), undo/redo (M10), auto-pan
+while dragging near the viewport edge (M10).
 
 ## 6. HOW I WANT RESPONSES (read this carefully — it matters most)
 
@@ -311,6 +370,55 @@ Rules learned during M6 — apply them, don't re-derive them:
   overflow (long video) and the real cause (a missing class three components away)
   had nothing to do with each other.
 
+Rules learned during M7 — apply them, don't re-derive them:
+
+- **When an invariant spans several ENTITIES, the reducer must see them all at
+  once.** A group move clamps ONE shared delta; clamping each clip separately lets
+  the leftmost stop at 0:00 while the others carry on and destroys the spacing you
+  selected them together to preserve. That is the whole reason `moveClips` exists
+  instead of a loop of `updateClip`. The trap: with nothing blocked both approaches
+  agree exactly, so it survives casual testing and only appears at a boundary.
+- **A rule about the DATA belongs in the reducer; a rule about the GESTURE belongs
+  in the caller.** `start >= 0` is data — every writer must obey it. "Dragging the
+  left edge holds the clip's end still" is gesture — the reducer sees two numbers
+  and cannot know which you meant to hold, and `resize-right` deliberately wants the
+  opposite. Test: could another caller reasonably want the reverse?
+- **Snap proposes, clamp decides.** Snapping runs first, clamping last, so a target
+  sitting in forbidden territory is simply overruled.
+- **A threshold in PIXELS divided by zoom feels constant; one in seconds does not.**
+  `SNAP_PX / zoom` gives 0.8s of tolerance at 10 px/s and 0.02s at 400 px/s — the same
+  stickiness under the hand at any zoom. Same principle as `deltaPx / zoom`.
+- **Deltas need no `viewportStart`.** It cancels in a difference, which is exactly why
+  panning mid-drag cannot make a clip jump.
+- **Capture gesture origins once; never read the live value mid-gesture.** Every
+  dispatch re-renders, so the "current" start is already what the last move wrote.
+  Third time this appeared (PanelDivider, M6 overlay drag, M7 clip drag).
+- **Snapshot a SELECTION on the first move, not on pointerdown.** pointerdown also
+  dispatches the selection change, so the component's props are still the pre-click
+  selection at that instant.
+- **Decide a sub-gesture from coordinates, not from extra elements.** Resize handles
+  with their own `pointerdown` would each need `stopPropagation` — the M4 toolbar
+  smell. One handler reading `offsetX` against its own rect gives three zones; the
+  handle spans exist only to supply a cursor.
+- **A selector must never build an array.** Return the array already in the store;
+  `.map`/`.filter` hands `useSelector` a new reference on every update and re-renders
+  forever.
+- **Encode a UI rule in the selector when you can.** `selectSoleSelectedClip` returns
+  null unless exactly one clip is selected, so the panel *cannot* show the
+  single-clip form for a group.
+- **Never grow an array you are iterating.** `duplicateClips` collects copies then
+  pushes; pushing inside the loop duplicates the copies, forever.
+- **A spread copy shares its nested objects.** `{ ...clip, id }` hands the copy the
+  same `transform` and the same `props.keys`. Harmless *today* only because
+  `updateClip` replaces those wholesale — a property of another file that could change.
+- **Name a payload field for all its callers, not the first.** `moveClips` took
+  `startAtDragBegin`; a keyboard nudge is not a drag, so it is `fromStart` and both
+  callers share the action unchanged.
+- **Stale HMR errors accumulate.** The dev-server console showed import errors for
+  symbols that no longer existed anywhere, logged during an intermediate compile. A
+  reload does not clear the buffer. Check an error still matches the code in front of
+  you; the page rendering correctly is the better signal.
+
 ## 8. Architecture patterns we rely on (keep them consistent)
 
 - **Element is the source of truth.** The native `<video>` owns playback; Redux
@@ -342,35 +450,54 @@ Rules learned during M6 — apply them, don't re-derive them:
   not). Anchoring to the panel would float overlays over the letterbox bars and
   disagree with M8's export.
 
-### Current M6 file map (`frontend/features/timeline/`)
+### Current M7 file map (`frontend/features/timeline/`)
 
 ```
 types.ts             KeyboardClip | TextClip union, Track, ClipPatch,
                      NewOverlayClip, ClipTransform; fadeIn/fadeOut on ClipBase
-timelineSlice.ts     viewport + clip data; setZoom/panBy/zoomAt/fitToWindow/
-                     clampViewport + addClip/selectClip/updateClip/deleteClip.
-                     updateClip owns ALL invariants: start/duration vs
-                     videoDuration, fade ≤ duration, x/y 0–1 + rounded,
-                     scale/opacity clamped, rotation folded to one turn
-timelineSelectors.ts selectTimeline/Zoom/ViewportStart/Tracks/SelectedClipId,
-                     selectSelectedClip (derived: id → the clip object)
+timelineSlice.ts     viewport + clip data (503 lines, 13 reducers — see the split
+                     note below). updateClip owns ALL single-clip invariants:
+                     start/duration vs videoDuration, fade ≤ duration, x/y 0–1 +
+                     rounded, scale/opacity clamped, rotation folded, NaN refused.
+                     moveClips/duplicateClips clamp ONE SHARED delta/offset across
+                     the group. copyClip deep-copies transform + props
+timelineSelectors.ts selectTimeline/Zoom/ViewportStart/Tracks/SelectedClipIds,
+                     selectSoleSelectedClip (null unless EXACTLY one selected)
 timelineCoords.ts    PURE: timeToX, xToTime, tickStep, visibleTicks, clipRect,
-                     isRectVisible, minZoomFor, maxViewportStart
+                     isRectVisible, minZoomFor, maxViewportStart, MIN_CLIP_WIDTH=4
 overlayCoords.ts     PURE: draggedPosition (pixels → 0–1, mirror of xToTime),
                      roundPosition
 activeClips.ts       PURE: isClipActive, activeClipsAt  (half-open interval)
 clipOpacity.ts       PURE: clipOpacityAt — fade envelope × base opacity
+snapping.ts          PURE: SNAP_PX=8, snapTime, snapMovedClip (both edges, smaller
+                     correction wins), collectSnapTargets (excludes the whole
+                     moving group; ruler ticks deliberately NOT targets)
 newClip.ts           PURE: makeNewClip, DEFAULT_CLIP_DURATION, MIN_CLIP_DURATION,
                      DEFAULT_TRANSFORM, MIN_SCALE, MAX_SCALE
-components/Timeline.tsx        ruler + lanes + playhead; scrub, wheel zoom/pan
+hooks/useTimelineShortcuts.ts  Delete / Ctrl+D / `,` `.` on the selection
+components/Timeline.tsx        ruler + lanes + playhead; scrub, wheel zoom/pan,
+                               px→s conversions for all three clip gestures,
+                               group-origin snapshot, snap guide (429 lines)
 components/TimelineToolbar.tsx + Keys / + Text / Fit  (outside the pointer root)
-components/ClipBlock.tsx       one clip as a lane block; click selects
+components/ClipBlock.tsx       one clip as a lane block; owns the gesture, picks
+                               move/resize-left/resize-right from coordinates,
+                               reports PIXELS; 3px click-vs-drag threshold
 components/OverlayCanvas.tsx   live overlays on the preview; measures the video
                                box; per-clip transform; drag with pointer capture
 components/ClipInspector.tsx   Properties form: name/start/length/fades/props
+components/MultiClipInspector.tsx  the N-selected panel: count, delete all, clear
 components/TransformFields.tsx X/Y/Scale/Rotation/Opacity sliders + Reset
 components/Field.tsx           shared labelled row + INPUT class string
 ```
+
+Shared: `frontend/utils/isTypingTarget.ts` — the "user is typing" guard both
+keyboard hooks use.
+
+**Two files are over the size we agreed and want a refactor step of their own
+(don't fold it into other work):** `timelineSlice.ts` at 503 lines — the seam is the
+existing `--- clip data actions ---` comment; and `Timeline.tsx` at 429 lines, over
+the ~300 component limit — the natural extraction is a `useClipGestures` hook holding
+`groupOrigins`, the snap-target assembly and the three conversions.
 
 Panel layout note (found during M6): `components/layout/Panel.tsx` needs
 `h-full` — without it the section is content-height, every percentage height
@@ -429,6 +556,16 @@ the panel's WIDTH, overflowing into the timeline row.
   is cosmetic. Fix = a requestAnimationFrame mirror.
 - ~~Nothing clamps `clip.start` against the video's length.~~ **Fixed in M6
   Step 6**: `updateClip` clamps `start` to `videoDuration - MIN_CLIP_DURATION`
-  when the caller passes `videoDuration`. M7's drag and M9's loader must pass it
-  too — it is optional in the payload type.
+  when the caller passes `videoDuration`. M7's drag, resize and nudge all pass it;
+  M9's loader must too — it is optional in the payload type.
+- **Opening a SHORTER video leaves clips beyond its end** (found in M7 Step 6, not
+  fixed). `videoOpened` resets the player slice but never touches
+  `state.timeline.tracks`, so a 90s project loaded against a 10s video keeps overlays
+  at second 80 — unreachable and unrenderable. Every clamp runs when a value is
+  *written*; here the bounds moved underneath a value that was legal. Needs a
+  `clampClipsToVideo({ videoDuration })` action dispatched on video load. Not urgent
+  while nothing persists (M9), and M9's project loader will want the same action.
+- **No auto-pan while dragging near the viewport edge** (M10). Drag a clip until its
+  block is entirely off-screen in a scrolled viewport and `isRectVisible` culls it,
+  the component unmounts, and pointer capture dies with it. Takes deliberate effort.
 - `frontend/AGENTS.md` is auto-recreated by `next dev`; committing it is fine.
