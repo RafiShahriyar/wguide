@@ -2062,6 +2062,767 @@ permission to launch any executable — `where.exe` fails identically, while
 Rust could compile but not link. **M6 is therefore frontend-verified, not
 fully-gated**, and should not be recorded as green until both are resolved.
 
+## Milestone 7 — Timeline Editing
+
+M6 gave overlays geometry on the video. M7 makes the *timeline* editable: move,
+resize, snap, multi-select, duplicate.
+
+### Step 1 — Move a clip along its lane
+
+**Files touched:** `frontend/features/timeline/components/ClipBlock.tsx`,
+`frontend/features/timeline/components/Timeline.tsx`
+
+**New concepts:** the click-vs-drag threshold; why a *delta* conversion has no
+`viewportStart` term; splitting a gesture from the maths it feeds.
+
+#### Who owns what
+
+`ClipBlock`'s header comment has said since M5 that it is deliberately dumb — no
+time↔pixel math, nothing from the store. M7 keeps that, and the split turns out
+to fall naturally:
+
+| concern | lives in | why |
+|---|---|---|
+| pointer capture, threshold, "where did this clip start?" | `ClipBlock` | it owns the element the gesture happens on |
+| pixels → seconds, dispatching | `Timeline` | it owns `zoom`, and it already owns every other conversion |
+
+So `ClipBlock` reports `onMoveBy(id, startAtDragBegin, deltaPx)` — three facts it
+already knows — and stays ignorant of zoom.
+
+#### Worked example — dragging a clip two seconds later
+
+`zoom = 40` px/s, `viewportStart = 0`. A clip at `start: 5.0, duration: 2.0`, so
+its block is drawn at `x = 200`, `width = 80`.
+
+**1. `pointerdown`** at `clientX: 520`:
+
+```ts
+onSelect(clip.id);                                    // select immediately
+gesture.current = { pointerX: 520, start: 5.0 };      // capture the origin ONCE
+event.currentTarget.setPointerCapture(event.pointerId);
+```
+
+**2. Pointer twitches to 522.** `deltaPx = 2`, below the 3px threshold → **nothing
+happens at all**. No dispatch, no store write. Still a click.
+
+**3. Pointer reaches 560.** `deltaPx = 40`, past the threshold:
+
+```
+onMoveBy(id, 5.0, 40)
+  → start = 5.0 + 40 / 40 = 6.0
+  → dispatch(updateClip({ id, patch: { start: 6.0 }, videoDuration }))
+```
+
+**4. Re-render.** `clipRect(6.0, 2.0, 0, 40)` → `x = 240`. The block is 40px right
+of where it was, and the pointer moved 40px. They match exactly, which is the
+whole test of whether the conversion is right.
+
+Nothing "moved" the block. Its position is recomputed from `clip.start` every
+render, exactly as it has been since M5 — the drag only changes the number.
+
+**Zoom independence for free.** Zoom to 400 px/s and the same 40px gesture is
+`40/400 = 0.1s`. One gesture, ten times finer control, because the divisor *is*
+the zoom.
+
+#### Why there is no `viewportStart` in the delta
+
+`xToTime` needs `viewportStart` because it maps an absolute pixel to an absolute
+second. A delta is a *difference*, and the term cancels:
+
+```
+xToTime(x₂) − xToTime(x₁)
+  = (viewportStart + x₂/zoom) − (viewportStart + x₁/zoom)
+  = (x₂ − x₁) / zoom
+```
+
+That is not a shortcut, it is the reason the drag is robust: if the viewport pans
+mid-gesture, the clip cannot jump, because `viewportStart` was never in the sum.
+
+#### Pitfall — a click and a drag start with the identical event
+
+One `pointerdown` on a block has three plausible meanings: select it, drag it, or
+(if it reached the lane beneath) scrub the playhead. Three defences, each doing one
+job:
+
+- `event.stopPropagation()` — already there since M5, so the timeline root's
+  scrub handler never sees it. This is the *legitimate* kind of
+  `stopPropagation`: one element, one reason, documented. Not the smell the M4
+  toolbar had, where every button needed one.
+- `onSelect` fires on `pointerdown`, so selection is instant either way.
+- The 3px threshold decides drag-or-click. Without it, hand tremor retimes the
+  clip by `1/zoom` seconds — 0.025s at 40 px/s — on every single selection click,
+  and each one is a real store write.
+
+#### Pitfall — capture the origin, never read it live
+
+`gesture.current.start` is recorded on `pointerdown` and never re-read. Every move
+dispatches, every dispatch re-renders, so `clip.start` mid-drag is *already* the
+value the last move wrote. Combining that with the total delta makes the clip
+accelerate away from the cursor. Third time this trap has appeared —
+`PanelDivider`, M6's overlay drag, now here — and the fix is identical each time.
+
+#### The `videoDuration` note, redeemed
+
+M6 Step 6 made `videoDuration` optional in `updateClip`'s payload and left a note
+that M7's drag must pass it. This is that caller:
+
+```ts
+dispatch(updateClip({ id, patch: { start: … }, videoDuration: duration }));
+```
+
+Drag a clip hard to the right in a 96.4s video and the reducer stops it at
+`96.4 − 0.5 = 95.9`. Drag hard left and it stops at `0`. **No clamping logic
+exists in the drag handler** — it inherited all of it.
+
+#### Known limitation — no auto-pan at the edges
+
+Drag a clip past the left edge of a scrolled viewport and, once the block is
+*entirely* off-screen, `isRectVisible` culls it, the component unmounts, pointer
+capture dies with it, and the drag ends. It takes deliberate effort (the clip also
+clamps at 0), and `MIN_CLIP_WIDTH = 4` means a block is never a hairline. The real
+fix is auto-panning while dragging near an edge, which is a feature in its own
+right — noted here, not smuggled into this step.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages. Page loads
+with no application errors (only the expected `127.0.0.1:3939/health` refusals).
+**The drag itself is not machine-verified** — clip blocks only exist once a video
+is loaded, and a file `<input>` cannot be driven from outside the browser.
+
+### Step 2 — Resize by dragging the edges
+
+**Files touched:** `frontend/features/timeline/components/ClipBlock.tsx`,
+`frontend/features/timeline/components/Timeline.tsx`
+
+**New concepts:** deciding a gesture from coordinates instead of from separate
+handle elements; a rule about the GESTURE versus a rule about the DATA.
+
+#### One handler, three zones
+
+Step 1 had one gesture; now there are three. The obvious implementation is a
+handle element at each end with its own `pointerdown` — and it is the wrong one,
+because each handle would then need `stopPropagation` to stop the block's own move
+gesture firing as well. "Every child needs a `stopPropagation`" is precisely the
+smell that moved the toolbar out of the pointer root back in M4.
+
+So the block keeps its single handler and works out *which* gesture from the
+pointer's position within its own rect:
+
+```ts
+const rect = event.currentTarget.getBoundingClientRect();
+const offsetX = event.clientX - rect.left;
+const kind: ClipGesture = !showHandles
+  ? "move"
+  : offsetX <= HANDLE_PX          ? "resize-left"
+  : offsetX >= rect.width - HANDLE_PX ? "resize-right"
+  : "move";
+```
+
+The two handle `<span>`s that appear on hover have **no handlers at all**. They
+exist to supply a `cursor-ew-resize` and a visual hint; their pointer events
+bubble straight up to the button, which does the coordinate maths anyway. (They
+are spans, not divs, because a `<button>`'s content model is phrasing content.)
+
+**And a narrow-block guard.** At full zoom-out a clip is drawn at
+`MIN_CLIP_WIDTH = 4`px. Carve 6px off each end of that and there is no middle
+left — the clip becomes nothing but handles and could never be moved again. So
+below `HANDLE_PX * 3` the whole block means "move" and the handles are not drawn.
+
+#### The left edge, and the trap in it
+
+The right edge is easy: only `duration` changes, and the reducer's existing floor
+and ceiling apply untouched. The left edge must change **`start` and `duration`
+together so the clip's END stays put** — and getting there naively produces a real
+bug. Verified numerically, on a clip at `start: 2, duration: 3` (so it ends at 5),
+dragged 4 seconds left:
+
+| approach | result | |
+|---|---|---|
+| naive — send `start: −2, duration: 7`, let the reducer clamp | `start 0, duration 7, end 7` | ❌ the end **moved** |
+| guarded — clamp start first, derive duration from it | `start 0, duration 5, end 5` | ✅ |
+
+In the naive version the reducer dutifully pins `start` to 0 — that is its job —
+but it has no reason to touch the length it was handed, so the end slides from 5
+to 7 and the clip grows out from under your cursor.
+
+```ts
+const end = origin.start + origin.duration;
+const nextStart = clamp(origin.start + deltaSeconds, 0, end - MIN_CLIP_DURATION);
+dispatch(updateClip({ id, patch: { start: nextStart, duration: end - nextStart }, videoDuration: duration }));
+```
+
+#### The distinction worth keeping
+
+That clamp lives in the **caller**, which looks at first glance like it violates
+the rule we have been applying since M5 — invariants belong in the reducer. It
+does not, and the difference is the useful idea:
+
+- **"`start` >= 0" is a rule about the DATA.** Every writer must obey it, so it
+  lives in the reducer and everybody inherits it.
+- **"this gesture keeps the end fixed" is a rule about the GESTURE.** The reducer
+  only ever sees two numbers; it cannot know which of them you meant to hold
+  still. `resize-right` deliberately lets the end move. Pushing this into the
+  reducer would mean teaching it about pointer intent.
+
+The test: could another caller reasonably want the opposite? For "start ≥ 0", no.
+For "hold the end still", yes — that is `resize-right`.
+
+#### Verified numerically
+
+`MIN_CLIP_DURATION = 0.5`, clip at `start: 2, duration: 3`, end 5:
+
+| gesture | result |
+|---|---|
+| left edge, 1s left | `start 1, duration 4, end 5` |
+| left edge, 2.8s right | `start 4.5, duration 0.5, end 5` (hits the floor) |
+| left edge, 10s right | `start 4.5, duration 0.5, end 5` (cannot invert) |
+| right edge, 2s right | `start 2, duration 5, end 7` (start untouched) |
+| right edge, 10s left | `start 2, duration 0.5, end 2.5` (hits the floor) |
+
+Dragging the left edge far past the right one cannot flip the clip inside out; it
+simply parks at the minimum length with its end still nailed to second 5.
+
+#### Free inheritance, again
+
+Trimming a clip shorter than its fade needs no code here at all: M6 Step 6 put
+`clip.fadeIn = Math.min(clip.fadeIn, clip.duration)` in the reducer, so a 4s clip
+with a 3s fade-in trimmed down to 1s brings its fade down with it. That invariant
+was written for the Length number box and a drag it knew nothing about inherited
+it.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages; page loads
+with no application errors; the resize arithmetic verified numerically against the
+table above, including the naive-vs-guarded comparison. **The gestures themselves
+are not machine-verified** — blocks need a loaded video.
+
+### Step 3 — Snapping
+
+**Files touched:** `frontend/features/timeline/snapping.ts` (new),
+`frontend/features/timeline/components/ClipBlock.tsx`,
+`frontend/features/timeline/components/Timeline.tsx`
+
+**New concepts:** a tolerance defined in pixels but compared in seconds; choosing
+between two candidate corrections; a ref and a piece of state side by side for
+opposite reasons.
+
+#### The one line the whole step rests on
+
+```ts
+const tolerance = bypassSnap ? 0 : SNAP_PX / zoom;
+```
+
+`SNAP_PX` is **8 pixels**. Dividing by zoom turns it into seconds, and that is
+what makes snapping feel constant under your hand at any zoom:
+
+| zoom | tolerance |
+|---|---|
+| 10 px/s (zoomed out) | 0.800s |
+| 40 px/s | 0.200s |
+| 120 px/s | 0.067s |
+| 400 px/s (zoomed in) | 0.020s |
+
+Define the tolerance in *seconds* instead and it inverts: immovably sticky when
+zoomed out, useless when zoomed in. **Pixels are how the gesture feels; seconds
+are what the data means; the conversion belongs at the boundary between them** —
+the same principle as `deltaPx / zoom` in Step 1, applied to a threshold instead
+of a movement.
+
+Alt sends a tolerance of `0`, and `snapTime` bails immediately on `<= 0`. That is
+why the bypass needs no branch anywhere else in the code.
+
+#### A move snaps whichever edge is closer
+
+Snapping only the clip's start would be half a feature — you could line a clip's
+beginning up with things but never butt its **end** against the next clip. So
+`snapMovedClip` tries both edges and keeps the **smaller correction**, so the clip
+jumps as little as possible:
+
+```ts
+const startCorrection = byStart.guide === null ? Infinity : Math.abs(…);
+const endCorrection   = byEnd.guide   === null ? Infinity : Math.abs(…);
+if (startCorrection <= endCorrection) return byStart;
+return { time: byEnd.time - duration, guide: byEnd.guide };   // derive start from the end
+```
+
+`Infinity` for "this edge found nothing" is doing real work: without it there are
+three combinations to handle (start only, end only, both), and with it there is
+one comparison. Same trick as `Math.min` in M6's fade envelope — pick the
+representation so the awkward cases stop being special.
+
+#### Worked example — verified numerically
+
+Another clip occupies **10 → 13**. The playhead is at **5**. Video is 96.4s. So
+the targets are `[0, 5, 96.4, 10, 13]`. The dragged clip is **2s** long, zoom 40
+(tolerance 0.2s):
+
+| candidate start | result | what happened |
+|---|---|---|
+| 9.90 | start **10.0**, end 12.0, guide 10 | start was 0.1 from 10 |
+| 8.05 | start **8.0**, end **10.0**, guide 10 | the END snapped — clip butts against the neighbour |
+| 4.92 | start **5.0**, end 7.0, guide 5 | snapped to the playhead |
+| 9.00 | start 9.0, end 11.0, guide **null** | nothing within 0.2s |
+| 10.85 | start **11.0**, end **13.0**, guide 13 | end snapped to the neighbour's end |
+| 9.90 with Alt | start 9.9, guide null | bypassed |
+
+The duration is exactly 2 in every row. **A move never resizes**, whichever edge
+did the snapping.
+
+Ties resolve to the start (`<=`, not `<`), so the same drag always gives the same
+answer rather than depending on the order of the targets array.
+
+#### Order matters: snap proposes, clamp decides
+
+In `resize-left` the snap runs *before* the clamp:
+
+```ts
+const snapped = snapTime(origin.start + deltaSeconds, targets, tolerance);
+const nextStart = clamp(snapped.time, 0, end - MIN_CLIP_DURATION);
+```
+
+A snap target can sit inside forbidden territory — the playhead might be at
+second 0.1 while the clip's fixed end is 0.4 away. Snapping first and clamping
+second means the illegal suggestion is simply overruled. Reverse the two and a
+target could pull the clip back out of legality after the clamp had fixed it.
+
+#### What is NOT a snap target
+
+Ruler ticks. At low zoom every tick becomes a magnet, dragging turns gritty, and
+the ticks stop being a reading aid and become a grid nobody asked for. The targets
+are things with *meaning*: the playhead, other clips' edges, the start and end of
+the footage.
+
+Also excluded: **the dragged clip's own edges.** Not an optimisation — leave them
+in and the clip snaps to where it already is and cannot be moved at all.
+
+#### A ref and a state, side by side, for opposite reasons
+
+`Timeline` now holds both, three lines apart:
+
+```ts
+const scrubbing = useRef(false);                          // must NOT re-render
+const [snapGuide, setSnapGuide] = useState<number|null>(null);  // must re-render
+```
+
+`scrubbing` is a fact about the gesture that nothing draws — a ref, so setting it
+mid-drag costs nothing. `snapGuide` is a fact that *is* drawn, as the amber guide
+line, so it has to be state. The choice is not stylistic: it follows from whether
+anything renders the value.
+
+The guide line matters more than it looks. Snapping without feedback feels like the
+clip fighting you; with a line showing *what* it stuck to, it reads as assistance.
+It is drawn beneath the playhead so the two stay distinguishable when a clip snaps
+to the playhead itself.
+
+`ClipBlock` reports `onGestureEnd` so the line can be cleared — and only if a drag
+actually happened, since a plain click never showed one.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages; page loads
+with no application errors; the snap arithmetic verified numerically against the
+table above, including the Alt bypass and the tie-break. **The gesture itself is
+not machine-verified** — blocks need a loaded video.
+
+### Step 4 — Multi-select
+
+**Files touched:** `timelineSlice.ts`, `timelineSelectors.ts`, `snapping.ts`,
+`components/ClipBlock.tsx`, `components/Timeline.tsx`,
+`components/MultiClipInspector.tsx` (new), `components/ClipInspector.tsx`,
+`features/layout/components/PropertiesPanel.tsx`
+
+**New concepts:** why a group edit needs its own reducer action; array identity in
+selectors; snapshot timing versus dispatch; encoding a UI rule in a selector.
+
+#### The model change
+
+```diff
+- selectedClipId: string | null;
++ selectedClipIds: string[];
++ selectionAnchorId: string | null;
+```
+
+The anchor is separate on purpose: the selection is a **set** with no meaningful
+order, while "the clip you last clicked deliberately" is its own fact, and only the
+anchor can tell a Shift-click what to measure a range *from*.
+
+One value becoming a collection rippled through seven files, and the compiler found
+every one — the same service the required `transform` field did in M6 Step 1.
+
+#### What a click means
+
+| gesture | action | why |
+|---|---|---|
+| plain click, clip not selected | `selectClip(id)` — replace | the ordinary case |
+| plain click, clip **already** selected | **nothing** | see below |
+| Ctrl/Cmd-click | `toggleClipSelection(id)` | add or remove |
+| Shift-click | `selectClipRange(id)` | anchor → this clip, by TIME |
+| click empty lane | `selectClip(null)` | clear |
+
+That second row is the subtle one. Press on a member of a multi-selection intending
+to drag the group, and replacing the selection would **collapse the group to one
+clip the instant you touched it** — a group drag would be impossible. So a plain
+click on an already-selected clip changes nothing and lets the drag proceed.
+
+The cost, stated honestly: you cannot collapse a multi-selection by clicking one of
+its members. Click empty space first. Real editors solve this by deciding on
+*pointer-up* whether a drag happened; that is more machinery than this step needs.
+
+Ranges are computed by **start time**, not array order — `track.clips` is in
+creation order, so "between" has to mean between in time or the selection looks
+arbitrary. And the anchor deliberately does not move on a Shift-click, which is what
+makes a range adjustable by shift-clicking again.
+
+#### The centrepiece: why `moveClips` exists
+
+A group drag is **not** N calls to `updateClip`, and the reason is the clamp. Three
+clips at `[1, 5, 10]`, gaps of `[4, 5]`, in a 96.4s video:
+
+| gesture | clamp the DELTA once | clamp EACH clip |
+|---|---|---|
+| drag 3s **left** | `[0, 4, 9]` gaps `[4, 5]` ✅ | `[0, 2, 7]` gaps `[2, 5]` ❌ |
+| drag 90s **right** | `[86.9, 90.9, 95.9]` gaps `[4, 5]` ✅ | `[91, 95, 95.9]` gaps `[4, 0.9]` ❌ |
+| drag 2s right | `[3, 7, 12]` gaps `[4, 5]` | `[3, 7, 12]` gaps `[4, 5]` |
+
+Clamping each clip separately lets the leftmost stop at 0:00 while the others carry
+on, and the relative spacing — **the very thing you selected them together to
+preserve** — is destroyed.
+
+Look hard at the third row: when nothing is blocked, both approaches agree exactly.
+That is what makes this bug dangerous. It survives casual testing and only appears
+when the group touches a boundary. Verified numerically rather than by eye.
+
+```ts
+let allowed = finiteOr(deltaSeconds, 0);
+for (const move of moves) {
+  allowed = clamp(allowed, -move.startAtDragBegin, latestStart - move.startAtDragBegin);
+}
+for (const move of moves) { … clip.start = move.startAtDragBegin + allowed; }
+```
+
+Every clip narrows one shared delta, then the survivor is applied to all. **Only
+code that can see every clip at once can enforce that** — which is the whole
+argument for a new action instead of a loop in the component.
+
+Note what the caller dispatches: the delta the dragged clip actually **took** after
+snapping, not its absolute new start. Everyone else moves by the same amount.
+
+#### Pitfall — a selector that builds an array re-renders forever
+
+```ts
+export const selectSelectedClipIds = (state) => state.timeline.selectedClipIds;
+```
+
+It returns the array *already in the store*, so its identity changes only when the
+selection does. Write `.map` or `.filter` in a selector and `useSelector` gets a
+brand-new reference on **every store update** — a fresh array is never `===` the
+previous one — and every consumer re-renders forever. This is why there is no
+`selectSelectedClips` returning clip objects: nothing needed it, and adding it would
+have meant reaching for memoisation to undo a problem better avoided.
+
+#### Pitfall — snapshot on the first MOVE, not on pointerdown
+
+The group's starting positions have to be recorded once per gesture. The obvious
+place is `pointerdown` — and it is wrong:
+
+```
+pointerdown → dispatch(selectClip(id))       // selection changes
+            → but this component's props are STILL the pre-click selection
+```
+
+Snapshot there and you capture whatever was selected a moment ago. Waiting for the
+first `pointermove` means the re-render has happened and `selectedClipIds` is what
+the user actually has selected. The lazy snapshot is not a shortcut — it is the
+*correct* timing, and it also removed the need for an `onGestureStart` callback.
+
+#### Pitfall — a group must not snap to itself
+
+`collectSnapTargets` took one `excludeClipId`; it now takes `excludeClipIds` and is
+handed **the whole moving group**. Leave one moving clip in and it snaps to where it
+already is; leave its fellow travellers in and the group snaps to its own members
+and locks up.
+
+Snapping still follows the clip **under the cursor** — that is the reference the
+user is aiming with — and the delta it produces is applied to everyone.
+
+#### Encoding a UI rule in a selector
+
+`selectSoleSelectedClip` returns `null` unless **exactly one** clip is selected. The
+full form edits one clip's name, start and length, and there is no obviously-right
+meaning for typing one Start into five clips: should they all begin together, or keep
+their spacing and shift? The second is what dragging already does, so the form does
+not guess — several clips get `MultiClipInspector`, which offers only what is
+unambiguous for a group (count, delete, clear).
+
+Putting that rule in the selector rather than in the panel means the panel *cannot*
+render the single-clip form for a group by mistake. The question was settled one
+layer down.
+
+#### A note on reading dev-server errors
+
+Mid-way through this step the browser console showed import errors for
+`selectSelectedClip` and `deleteClip` — both of which no longer existed anywhere.
+They were **stale HMR entries**, logged when `next dev` recompiled after the selector
+file was edited but before its consumers were. The console buffer accumulates across
+recompiles and a reload does not clear it. Check that an error still matches the code
+in front of you before chasing it; the page rendering correctly is the better signal.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages; grep confirms
+no references to the removed `selectedClipId` / `selectSelectedClip` / `deleteClip` /
+`excludeClipId` remain; the app renders with the new zero-selection state; the group
+clamp verified numerically against the table above. **The gestures are not
+machine-verified** — blocks need a loaded video.
+
+### Step 5 — Duplicate + keyboard
+
+**Files touched:** `frontend/utils/isTypingTarget.ts` (new),
+`frontend/features/timeline/hooks/useTimelineShortcuts.ts` (new),
+`frontend/features/player/hooks/usePlayerShortcuts.ts`,
+`frontend/features/timeline/timelineSlice.ts`,
+`frontend/features/timeline/components/Timeline.tsx`,
+`frontend/components/layout/EditorShell.tsx`
+
+**New concepts:** two global key handlers that must not collide; copying nested
+mutable state; naming a payload field for all its callers rather than the first.
+
+#### The keyboard conflict, resolved rather than papered over
+
+`usePlayerShortcuts` already owns the arrow keys **twice**: ±5s, and ±0.1s with
+Shift. So arrow-nudge was never available. Two `window` listeners both calling
+`preventDefault` on the same key would leave the winner up to listener registration
+order, which is not a design — it is a race that happens to work.
+
+So nudge is bound to **`,` and `.`** (Shift for a 1s step instead of 0.1s). They are
+adjacent on the keyboard, unclaimed, and the convention in several real editors.
+
+The two hooks are mounted side by side in `EditorShell` with a comment saying they
+share no bindings — because the next person to add a shortcut needs to know that is
+an invariant, not an accident.
+
+#### Extracted on its second use
+
+`usePlayerShortcuts` had the "is the user typing?" guard inline. `useTimelineShortcuts`
+needs exactly the same rule, so it moved to `utils/isTypingTarget.ts`.
+
+This one earns its extraction more than most: without it, typing `Q, E` into the Keys
+field fires the shortcuts bound to those keystrokes, and pressing **Delete** to fix a
+typo in the Name box deletes the clip you were editing. Two copies of a guard like
+that is how they drift apart, and the failure is silent.
+
+#### One early return that does real work
+
+```ts
+if (selectedClipIds.length === 0) return;
+```
+
+Every shortcut here acts on the selection, so with nothing selected there is nothing
+to do — and, crucially, **no key to swallow**. Backspace still reaches the browser,
+Ctrl+D still bookmarks. A global handler that calls `preventDefault` for keys it is
+not going to act on is a bug that only shows up as "the browser feels broken".
+
+Where it *does* act, `preventDefault` is mandatory: the browser's own Ctrl+D is
+"bookmark this page", and without it you get a bookmark dialog on every duplicate.
+
+#### Duplicate: one shared offset, again
+
+The copies are shifted by the **span of the whole selection**, so the new group lands
+just past the old one with its internal spacing intact. Offsetting each clip by its
+own length would scramble a group's rhythm — the same reasoning as the shared delta
+in `moveClips`. Verified numerically, in a 96.4s video (last legal start 95.9):
+
+| selection | offset | copies land at | |
+|---|---|---|---|
+| one clip at 5 (2s) | 2 | `[7]` | immediately after |
+| group `[1, 5, 10]`, gaps `[4, 5]` | 11 | `[12, 16, 21]`, gaps `[4, 5]` | spacing intact |
+| group `[90, 94]` near the end | **1.9** | `[91.9, 95.9]`, gaps `[4]` | offset shrank to fit |
+| a clip already at 95.9 | 0 | `[95.9]` | copy sits on the original |
+
+The third row is the interesting one: the offset is narrowed until *every* copy fits
+inside the footage, so the group stays legal and keeps its shape rather than having
+its last member clamped separately. The fourth is the honest fallback — when there is
+no room at all, the copy lands on top of the original. Visible and draggable, which
+beats silently creating a clip past the end of the video where nothing would ever
+render it.
+
+The copies are selected afterwards, not the originals, because the thing you almost
+always want next is to drag what you just made.
+
+#### Pitfall — a spread copy shares its nested objects
+
+```ts
+// WRONG: the copy and the original share one transform object and one keys array
+const copy = { ...clip, id: crypto.randomUUID() };
+```
+
+`copyClip` copies every nested value explicitly: `{ ...clip.transform }` and
+`{ keys: [...clip.props.keys] }`. This is the `{ ...DEFAULT_TRANSFORM }` lesson from
+M6 in a new place — two objects sharing one piece of mutable state.
+
+Worth being precise about why it matters here, because it is currently *harmless*:
+`updateClip` replaces `transform` and `props` wholesale rather than mutating them, so
+today nothing would notice. But that is a property of code in another file that could
+change at any time, and the bug it would produce — editing one clip silently changing
+another — is exactly the kind nobody suspects. Two lines of copying removes the
+possibility rather than relying on a distant invariant.
+
+`copyClip` also lists the base fields one by one instead of spreading, so a new field
+on `ClipBase` stops it compiling until it has been considered — the same compile-time
+coverage the transform block gets in `updateClip`.
+
+#### Pitfall — never grow an array you are iterating
+
+```ts
+const additions: OverlayClip[] = [];
+for (const clip of track.clips) { … additions.push(copy); }
+track.clips.push(...additions);
+```
+
+Pushing straight into `track.clips` inside the loop would walk into the copies just
+added and duplicate those too — forever, until the browser gives up. Collect first,
+push after.
+
+#### Naming a payload for all its callers
+
+`moveClips` originally took `startAtDragBegin`. A keyboard nudge is not a drag, and it
+passes the clip's *current* start — so the field is now `fromStart`, and the action
+serves both callers with no change to its logic. A nudge **is** a group move with a
+keyboard-sized delta, which is why it reuses `moveClips` and inherits the shared-delta
+clamp that keeps a group's spacing when one member hits an end.
+
+Naming a parameter after the first caller quietly discourages the second from reusing
+it.
+
+**Verified:** `npm --prefix frontend run build` clean, 4/4 static pages; the app
+renders; the duplicate offset verified numerically against the table above. **The
+shortcuts themselves are not machine-verified** — they act on a selection, which needs
+clips, which needs a loaded video.
+
+### Step 6 — Guard rails + verification
+
+**Files touched:** `docs/Learning.md`, `docs/Roadmap.md`, `CLAUDE.md`
+
+**New concepts:** none — this step is a review pass, and finding nothing new to fix
+is a legitimate result.
+
+#### Who owns which invariant now
+
+M7 added three actions that write clip data. The point of this pass was to check
+that none of them quietly bypasses a rule `updateClip` already enforces:
+
+| action | what it may change | invariants applied | verdict |
+|---|---|---|---|
+| `updateClip` | any one clip | start/duration vs footage, fade ≤ duration, x/y clamped + rounded, scale/opacity clamped, rotation folded, NaN refused | unchanged |
+| `moveClips` | `start` of many | one **shared** delta clamped so every clip stays in `[0, videoEnd − MIN]`; NaN refused | correct |
+| `duplicateClips` | adds clips | one shared offset clamped so every copy fits; copies inherit already-valid duration, fades and transform | correct |
+| `deleteClips` | removes clips | prunes `selectedClipIds` and clears `selectionAnchorId` if it pointed at a deleted clip | correct |
+
+`moveClips` and `duplicateClips` never touch `duration`, `fadeIn`, `fadeOut` or
+`transform`, so they cannot invalidate those — and the values they copy were already
+legal when `updateClip` last wrote them. That is the payoff of having put the rules in
+one place in M6: two new writers arrived and needed no new validation.
+
+#### A gap this pass DID find (not fixed here)
+
+**Open a shorter video and existing clips can end up beyond its end.** `videoOpened`
+resets the player slice — status, duration, currentTime — but never touches
+`state.timeline.tracks`. So loading a 10-second clip after a 90-second one leaves
+overlays at second 80: unreachable, unrenderable, and invisible in a timeline that
+now only extends to 10.
+
+Every clamp in the codebase is applied *when a value is written*. This is the other
+case: the value was legal when written, and the **bounds moved underneath it**. The
+fix is an action along the lines of `clampClipsToVideo({ videoDuration })` dispatched
+when a new video loads — but that is new behaviour, not a guard rail on existing
+behaviour, so it is recorded here rather than smuggled into a verification step.
+
+It is not urgent: clips do not survive a reload yet (persistence is M9), so this only
+bites within a single session, and M9 will need exactly the same action for loading a
+project file against a different video.
+
+#### Two housekeeping findings
+
+| file | lines | guideline | note |
+|---|---|---|---|
+| `timelineSlice.ts` | 503 | — | 13 reducers, two concerns |
+| `Timeline.tsx` | 429 | ≤ ~300 | over the component limit |
+
+Neither is broken; both are over the size we said we would keep to, and pretending
+otherwise in a verification step would defeat the point of having one.
+
+- **`timelineSlice.ts`** holds the viewport (zoom, pan) and the clip data
+  deliberately — that decision is recorded in CLAUDE.md §8. At 503 lines the
+  deliberate choice is starting to cost more than it saves; the natural seam is
+  exactly where the `--- clip data actions ---` comment already sits.
+- **`Timeline.tsx`** grew by ~200 lines across M7 for gesture handling. The natural
+  extraction is a `useClipGestures` hook holding `groupOrigins`, the snap-target
+  assembly and the three conversions, leaving the component to render.
+
+Both are refactors, not fixes, so they want their own step and an explicit go-ahead
+rather than being folded into a checklist pass.
+
+#### The M7 manual checklist
+
+Nothing automated can see any of this. Requires a loaded video.
+
+**Move (Step 1)**
+1. Drag a block sideways → it tracks your hand 1:1; Start updates live in Properties.
+2. Click without moving → selects, and the clip does **not** shift (the 3px threshold).
+3. Zoom in hard, drag the same distance → retimes by much less.
+4. Drag hard left → parks at 0:00, never negative. Hard right → stops short of the end.
+
+**Resize (Step 2)**
+5. Hover the left/right 6px → `ew-resize` cursor and a pale bar.
+6. Drag the right edge → length changes, start stays.
+7. Drag the **left** edge → start and length both change and the clip's **right end
+   does not move**. The one to watch.
+8. Left edge hard left past 0:00 → stops at 0, end still unmoved.
+9. Left edge dragged right past the right end → parks at 0.5s, does not invert.
+10. Fade in 3 on a 4s clip, then trim to ~1s → the fade follows down.
+11. Zoom right out so a block is tiny → whole block moves, no resize zones.
+
+**Snap (Step 3)**
+12. Drag one clip's edge near another's → clicks into place, **amber line** appears.
+13. Drag so its **end** meets a neighbour's start → butts up flush, length unchanged.
+14. Drag near the playhead → snaps to it; amber line under the red one.
+15. Hold **Alt** while dragging → no snapping, no amber line; release mid-drag and it returns.
+16. Release after a snap → amber line disappears. Plain-click → no line ever appears.
+
+**Multi-select (Step 4)**
+17. Ctrl-click two clips → Properties reads "2 clips selected".
+18. Drag one of them → both move, spacing preserved **exactly**.
+19. Drag the pair into 0:00 → the leader stops and **the gap does not change**.
+20. Shift-click a third → the range between fills in.
+21. Ctrl-click a selected clip → it drops out, the others stay.
+22. Select two, drag near a third unselected clip → snaps to it, and the pair never
+    snaps to each other.
+23. Select exactly one → the **full** form returns.
+24. Resize while several are selected → only the one under the cursor changes.
+
+**Keyboard (Step 5)**
+25. Ctrl+D → copy lands immediately after, the **copy** is selected, no bookmark dialog.
+26. Select two, Ctrl+D → both copy past the group, gap preserved.
+27. Ctrl+D near the end of the video → the copy stays inside the footage.
+28. `.` / `,` → ±0.1s; Shift → ±1s. Watch Start.
+29. Nudge a group into 0:00 → leader stops, gap unchanged.
+30. Delete → selected clips and their overlays go together.
+31. Click into the **Name** field, type a comma, press Delete → the clip must **not**
+    move or vanish. That is `isTypingTarget`.
+32. ← / → → still seeks ±5s, no nudging.
+
+#### Verification status — read this honestly
+
+| gate | result |
+|---|---|
+| `npm --prefix frontend run build` | ✅ clean after every step, 4/4 static pages |
+| App renders, no application errors | ✅ (only the expected `127.0.0.1:3939/health` refusals) |
+| Group-move clamp | ✅ verified numerically — spacing preserved where per-clip clamping destroys it |
+| Resize-left end-stays-put | ✅ verified numerically, including the naive-vs-guarded comparison |
+| Snap arithmetic + Alt bypass + tie-break | ✅ verified numerically |
+| Duplicate offset, incl. near the video end | ✅ verified numerically |
+| `npm run build` (full gate) | ⛔ **cannot run on this machine** |
+| Manual checklist (32 items) | ⛔ **not yet run** |
+
+Same shape as M6: **M7 is frontend-verified, not fully-gated.** The blocker is the
+environment (nested PowerShell cannot launch executables; MSVC absent), not the code.
+Three checklists are now outstanding — M5's 10, M6's 16 and M7's 32 — and the
+overlap is deliberate: M7 rewrote the gesture handling that M5 and M6 relied on.
+
 ## Appendix — file map (M2 so far)
 
 | File | Role |
@@ -2077,12 +2838,15 @@ fully-gated**, and should not be recorded as green until both are resolved.
 | `frontend/components/layout/Panel.tsx` | generic panel: title + children slot; `h-full` so percentage heights inside resolve |
 | `frontend/components/layout/PanelDivider.tsx` | drag handle (oriented vertical/horizontal) → resizePanel |
 | `frontend/utils/clamp.ts` | clamp(value, min, max) helper |
+| `frontend/utils/isTypingTarget.ts` | "is the user typing?" guard shared by both keyboard hooks |
+| `frontend/features/timeline/hooks/useTimelineShortcuts.ts` | Delete / Ctrl+D duplicate / `,` `.` nudge, all acting on the selection |
 | `frontend/features/system/…` | system slice + selectors + status presentation + backend client |
 | `frontend/features/layout/layoutSlice.ts` | layout state + resizePanel/resetLayout |
 | `frontend/features/layout/layoutSelectors.ts` | selectPanels |
 | `frontend/features/layout/components/AssetsPanel.tsx` | left panel: placeholder asset list |
 | `frontend/features/layout/components/PreviewPanel.tsx` | center panel: video preview placeholder |
-| `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: renders ClipInspector for the selected clip |
+| `frontend/features/layout/components/PropertiesPanel.tsx` | right panel: picks none / one (ClipInspector) / several (MultiClipInspector) |
+| `frontend/features/timeline/components/MultiClipInspector.tsx` | what Properties shows for a multi-selection: count, delete all, clear |
 | `frontend/features/timeline/components/ClipInspector.tsx` | edit form for the selected clip: name, start, length, per-kind props, delete; renders TransformFields |
 | `frontend/features/timeline/components/Field.tsx` | shared labelled form row + INPUT class string (extracted on its second use) |
 | `frontend/features/timeline/components/TransformFields.tsx` | geometry half of the form: X/Y/Scale/Rotation/Opacity as slider+number pairs, plus Reset |
@@ -2095,17 +2859,18 @@ fully-gated**, and should not be recorded as green until both are resolved.
 | `frontend/features/player/components/TransportBar.tsx` | play/pause, seekbar, time readout |
 | `frontend/features/player/hooks/usePlayerShortcuts.ts` | Space/arrows/Ctrl+O dispatch commands |
 | `frontend/features/timeline/timelineSlice.ts` | viewport (zoom, viewportStart) + clip data; setZoom/panBy/zoomAt/fitToWindow/clampViewport, addClip/selectClip/updateClip/deleteClip |
-| `frontend/features/timeline/timelineSelectors.ts` | selectTimeline / selectZoom / selectViewportStart / selectTracks / selectSelectedClipId |
+| `frontend/features/timeline/timelineSelectors.ts` | selectTimeline / selectZoom / selectViewportStart / selectTracks / selectSelectedClipIds / selectSoleSelectedClip (null unless exactly one) |
 | `frontend/features/timeline/timelineCoords.ts` | pure timeToX / xToTime / tickStep / visibleTicks + viewport limits (minZoomFor / maxViewportStart) |
 | `frontend/features/timeline/types.ts` | overlay data model: KeyboardClip \| TextClip union, Track, ClipPatch, ClipTransform (absolute seconds; geometry as 0–1 fractions) |
 | `frontend/features/timeline/activeClips.ts` | pure isClipActive / activeClipsAt — which overlays are live at second T |
 | `frontend/features/timeline/clipOpacity.ts` | pure clipOpacityAt — the fade envelope multiplied into the clip's base opacity |
+| `frontend/features/timeline/snapping.ts` | pure snapTime / snapMovedClip / collectSnapTargets + SNAP_PX — edges stick to the playhead and neighbouring clips |
 | `frontend/features/timeline/newClip.ts` | pure makeNewClip + DEFAULT_TRANSFORM — defaults for a freshly added overlay |
 | `frontend/features/timeline/overlayCoords.ts` | pure draggedPosition + roundPosition — pointer pixels → 0–1 frame fractions (mirror of xToTime) |
 | `frontend/features/timeline/components/TimelineToolbar.tsx` | + Keys / + Text at the playhead, and Fit |
 | `frontend/features/timeline/components/OverlayCanvas.tsx` | draws the live overlays on the video preview; measures the video box; places each overlay from its own ClipTransform (centre-anchored, frame-relative scale); drag-to-position with pointer capture |
 | `frontend/features/timeline/components/Timeline.tsx` | ruler + track lanes + playhead; scrub-drag, wheel zoom/pan, Fit; TimelinePanel renders it |
-| `frontend/features/timeline/components/ClipBlock.tsx` | one overlay drawn as a block; presentational, colour per kind, click to select |
+| `frontend/features/timeline/components/ClipBlock.tsx` | one overlay drawn as a block; colour per kind, click to select, drag to retime, edge-drag to trim (owns the gesture and picks move/resize-left/resize-right from coordinates; reports pixels — parent converts) |
 
 **Retired in Step 6 (deleted):** `LayoutSizesDemo`, `LayoutPreview`,
 `HelloGuideForge`, `SystemStatusCard`. The app now boots directly into the

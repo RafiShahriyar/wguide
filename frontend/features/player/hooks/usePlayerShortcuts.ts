@@ -10,6 +10,7 @@ import {
   setPlaying,
 } from "@/features/player/playerSlice";
 import { selectPlayer } from "@/features/player/playerSelectors";
+import { isTypingTarget } from "@/utils/isTypingTarget";
 
 // The app-wide keyboard controls. It only talks to the store; VideoPlayer's
 // effects turn the state changes into element actions (play/pause/seek).
@@ -20,16 +21,7 @@ export function usePlayerShortcuts() {
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       // Never hijack keys while the user is typing in a form control.
-      const target = event.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.tagName === "SELECT" ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
+      if (isTypingTarget(event.target)) return;
 
       // Space = play/pause. Only meaningful once a video is loaded.
       if (event.key === " ") {
