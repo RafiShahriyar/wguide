@@ -126,18 +126,23 @@ multi-select (M7); per-overlay position/size (M6); persistence (M9) — clips
 vanish on restart.
 
 Git state:
-- `main` = M1→M5 (`fe0cae1`, dev merged via PR #4). **Nothing since has reached
-  GitHub yet.**
-- M6 is committed locally on `feature/m6-property-inspector`; M7 sits on top of it.
-  `git config --global user.name/user.email` are now set to
+- `main` = **M1→M6** (`08ee124`, M6 merged via PR #5). M1→M5 arrived earlier via
+  PR #4 (`fe0cae1`).
+- **M7 is pushed but NOT merged**: commit `5a6aa20` sits on
+  `feature/m6-property-inspector`, one ahead of main. ⚠️ That branch name is now
+  misleading — its own PR (#5) is already merged and it carries M7. A PR for M7 can
+  still be opened from it; renaming it to `feature/m7-timeline-editing` first would
+  read better.
+- `git config --global user.name/user.email` are set to
   `Rafi Shahriyar <rafi.shahriyar@g.bracu.ac.bd>`.
-- ⚠️ **Pushing cannot be done by the agent.** Git Credential Manager has no cached
-  token in this environment and tries to open an interactive login, which fails with
-  "could not read Username for 'https://github.com': terminal prompts disabled". `gh`
-  CLI is not installed either. The user must run `git push -u origin
-  feature/m6-property-inspector` in their own terminal once (browser/device-code
-  prompt), after which the token is cached. Then the PR can be opened on GitHub, or
-  `gh` installed (`winget install --id GitHub.cli -e`) and the agent can do it.
+- **Pushing works now.** It failed for most of the session — Git Credential Manager
+  had no cached token and tried to open an interactive login, which dies with "could
+  not read Username for 'https://github.com': terminal prompts disabled". The user
+  authenticated once in their own terminal and the token is now cached, so the agent
+  can push. If it ever fails that way again, the fix is one interactive
+  `git push` by the user, not anything in the repo.
+- `gh` CLI is **not installed** (`winget install --id GitHub.cli -e`), so the agent
+  cannot open PRs — only push. PRs must be opened on github.com.
 - `feature/m4-m5-timeline-overlays` holds the same work as one commit.
 - Strategy: `main` stable, `dev` integration (squash-merge features),
   `feature/<milestone>` branches. Remote: github.com/RafiShahriyar/wguide.
