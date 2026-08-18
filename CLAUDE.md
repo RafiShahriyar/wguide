@@ -70,13 +70,17 @@ npm run backend:dev    # Go backend only
 ```
 
 - Verify with `npm --prefix frontend run build` after each step (catches TS).
-- Full gate: `npm run build` at the end of a milestone — **blocked on the current
-  machine, see §10.** M6 was developed entirely through `npm run frontend:dev` in
-  a browser at `localhost:3000`, which needs neither Rust nor the Go sidecar. The
-  frontend has **no Tauri dependency at all** (no `@tauri-apps/api` in
-  `frontend/package.json`, zero Tauri calls in the source), and the video is
-  loaded through an ordinary `<input type="file">` + `URL.createObjectURL`, so
-  everything up to M8 can be built this way.
+- Full gate: `npm run build` at the end of a milestone. **This works again on the
+  home machine** (see §10 — it was blocked on the office laptop where M6/M7 were
+  written, which is why both shipped without it).
+- Frontend-only development still works and is faster for UI steps: M6 and M7 were
+  built entirely through `npm run frontend:dev` in a browser at `localhost:3000`,
+  which needs neither Rust nor the Go sidecar. The frontend has **no Tauri
+  dependency at all** (no `@tauri-apps/api` in `frontend/package.json`, zero Tauri
+  calls in the source), and the video is loaded through an ordinary
+  `<input type="file">` + `URL.createObjectURL`. **M8 is where that ends** —
+  ffmpeg cannot run inside the webview, so M8 needs the real Tauri window and the
+  Go sidecar.
 - Only the frontend install is needed for that: `npm install --prefix frontend`.
   The root `npm install` exists to fetch the Tauri CLI.
 - NEVER assume a library is available; check first. We have react, react-dom,
@@ -128,11 +132,12 @@ vanish on restart.
 Git state:
 - `main` = **M1→M6** (`08ee124`, M6 merged via PR #5). M1→M5 arrived earlier via
   PR #4 (`fe0cae1`).
-- **M7 is pushed but NOT merged**: commit `5a6aa20` sits on
-  `feature/m6-property-inspector`, one ahead of main. ⚠️ That branch name is now
-  misleading — its own PR (#5) is already merged and it carries M7. A PR for M7 can
-  still be opened from it; renaming it to `feature/m7-timeline-editing` first would
-  read better.
+- **M7 IS merged.** PR #6 brought `feature/m6-property-inspector` (which carried
+  the M7 commit `5a6aa20`) into main, so `main` = **M1→M7** at `9721df1`.
+  Verified with `git merge-base --is-ancestor 5a6aa20 origin/main`; `origin/main`
+  and that branch are byte-identical, so the branch is safe to delete.
+- `dev` was fast-forwarded to main (it had been stranded two milestones behind at
+  `b683baa`). M6 and M7 both went feature → PR → main, bypassing `dev`.
 - `git config --global user.name/user.email` are set to
   `Rafi Shahriyar <rafi.shahriyar@g.bracu.ac.bd>`.
 - **Pushing works now.** It failed for most of the session — Git Credential Manager
@@ -151,22 +156,21 @@ Git state:
 
 ## 5a. Verified state of the build
 
-**Current machine (M6 was built here):**
+**HOME machine, at `9721df1` (M1→M7) — the full gate PASSED, first time since M5:**
 
-- `npm --prefix frontend run build` — clean after every M6 step. This is the only
-  automated gate available here.
-- `npm run build` (full gate) — **cannot run at all**; see the nested-PowerShell
-  block in §10. Not a code problem.
-- Go sidecar never launched here (nothing answers on 3939), so the StatusBar shows
-  the backend offline and the browser console logs
-  `GET 127.0.0.1:3939/health` refusals. **That is the expected shape of
-  frontend-only development — not a bug to chase.**
+- `npm run build` — clean end to end: Go sidecar + Next static export +
+  TypeScript + Rust **release** (3m43s) + both bundles
+  `GuideForge_0.1.0_x64_en-US.msi` and `GuideForge_0.1.0_x64-setup.exe` under
+  `src-tauri/target/release/bundle/`. So M6 and M7 — which shipped from the
+  office laptop with only a TypeScript check — do compile, link and package.
+- `npm --prefix frontend run build` — clean (runs inside the above).
 
-**Previous machine (end of M5, for reference):** the full `npm run build` gate was
-clean there — Go + Next export + Rust release (~3m30s) + both
-`GuideForge_0.1.0_x64_en-US.msi` and `GuideForge_0.1.0_x64-setup.exe` under
-`src-tauri/target/release/bundle/`. Backend answered on 3939. ⚠️ That reply came
-from an **orphaned** backend, not a freshly launched one — see §10.
+**OFFICE laptop (where M6 and M7 were written), for reference:** only
+`npm --prefix frontend run build` was available; the full gate could not run at
+all (nested-PowerShell block, §10). The Go sidecar never launched there either,
+so the StatusBar showed the backend offline and the console logged
+`GET 127.0.0.1:3939/health` refusals — the expected shape of frontend-only
+development, not a bug to chase.
 
 **Two manual checklists are outstanding. Ask before assuming either milestone's
 behaviour is confirmed:**
@@ -498,11 +502,11 @@ components/Field.tsx           shared labelled row + INPUT class string
 Shared: `frontend/utils/isTypingTarget.ts` — the "user is typing" guard both
 keyboard hooks use.
 
-**Two files are over the size we agreed and want a refactor step of their own
-(don't fold it into other work):** `timelineSlice.ts` at 503 lines — the seam is the
-existing `--- clip data actions ---` comment; and `Timeline.tsx` at 429 lines, over
-the ~300 component limit — the natural extraction is a `useClipGestures` hook holding
-`groupOrigins`, the snap-target assembly and the three conversions.
+**Two files exceed the ~300-line convention and the user has decided to LEAVE THEM
+AS THEY ARE:** `timelineSlice.ts` (502 lines) and `Timeline.tsx` (428 lines).
+Splitting them would spread one cohesive concern across several files and, in the
+user's words, "overcomplicate the code". Do not propose a refactor step for these
+again; the size cap in §7 yields to that decision here.
 
 Panel layout note (found during M6): `components/layout/Panel.tsx` needs
 `h-full` — without it the section is content-height, every percentage height
@@ -533,22 +537,29 @@ the panel's WIDTH, overflowing into the timeline row.
   only the run path is stale. Fix the script in package.json, or run the built
   exe directly. `npm run dev` is unaffected — Tauri spawns the sidecar itself.
 - Tauri build downloads WiX/NSIS on first bundle.
-- **`npm run dev` / `npm run build` cannot run on the current machine.** A nested
-  PowerShell — one that is itself a child process — is denied permission to launch
-  *any* executable here. Verified: `where.exe`, `hostname.exe`, `node.exe`,
-  `go.exe` and `rustc.exe` all fail with "Access is denied" from a nested
-  `powershell` **or** `pwsh`, while `cmd.exe` launching the identical binary
-  succeeds, as does a top-level shell. Both npm scripts route through
-  `powershell -File scripts/…`, so both sit exactly on the blocked hop. Likely a
-  corporate endpoint policy (this is a domain machine: ACLs show `USB\<user>`);
-  `Get-MpPreference` would not load its module and the AppLocker query hung, so
-  the rule could not be positively identified without admin.
-  Workarounds: `npm run frontend:dev` and `npm --prefix frontend run build` are
-  unaffected (no PowerShell in the chain), and `cmd /c "<exe> …"` works.
-- **MSVC build tools are NOT installed** on the current machine (no `link.exe`,
-  no `cl.exe`, no `vswhere.exe`, no Windows SDK). Rust 1.97.1 + rustup 1.29.0 and
-  Go 1.26.5 are present, and Node is v24.11.1. So Rust can compile but cannot
-  link — needed before M8. WebView2 runtime 151.0.4129.72 is present.
+- **TWO MACHINES are in play — check which one you are on before trusting anything
+  below.** M6 and M7 were built on the user's OFFICE laptop; M8 onward is on the
+  HOME machine (`H:\Privarrte Ssttadi\VidGuide\wguide`, a proper clone, not the
+  nested `Downloads/wguide-main` folder described in §3).
+
+  **HOME machine (current, M8 is being built here) — everything works:**
+  Node v20.16.0 / npm 10.8.1, Go 1.26.5 windows/amd64, Rust stable-msvc 1.97.1
+  with `link.exe` present (VS 2022 BuildTools, MSVC 14.41.34120), and
+  **ffmpeg + ffprobe N-118350 on PATH** — the M8 prerequisite. A nested
+  PowerShell CAN launch executables here, so `npm run dev` and `npm run build`
+  both run normally.
+
+  **OFFICE laptop (where M6/M7 were written) — both npm scripts were blocked:**
+  a nested PowerShell was denied permission to launch *any* executable
+  (`where.exe`, `node.exe`, `go.exe`, `rustc.exe` all "Access is denied" from a
+  nested `powershell`/`pwsh`, while `cmd.exe` and a top-level shell succeeded).
+  Both scripts route through `powershell -File scripts/…`, exactly the blocked
+  hop. Likely a corporate endpoint policy (domain machine, ACLs show
+  `USB\<user>`); AppLocker could not be queried without admin. MSVC build tools
+  were also absent there, so Rust could compile but not link. Workarounds that
+  did work: `npm run frontend:dev`, `npm --prefix frontend run build`, and
+  `cmd /c "<exe> …"`. If a future session hits "Access is denied" launching a
+  binary, it is on the office laptop, not looking at a code problem.
 
 ## 11. Reminders / known deferred items
 
